@@ -1,0 +1,52 @@
+services:
+  gtnh:
+    image: itzg/minecraft-server:${MC_IMAGE_TAG:-java25}
+    container_name: ${CONTAINER_NAME:-gtnh}
+    restart: unless-stopped
+    stop_grace_period: 2m
+    stdin_open: true
+    tty: true
+    environment:
+      EULA: "TRUE"
+      TYPE: GTNH
+      TZ: ${TZ:-America/Santo_Domingo}
+      UID: ${UID:-1000}
+      GID: ${GID:-1000}
+      MEMORY: ${MEMORY:-16G}
+      GTNH_PACK_VERSION: ${GTNH_PACK_VERSION:-latest}
+      SKIP_GTNH_UPDATE_CHECK: ${SKIP_GTNH_UPDATE_CHECK:-false}
+      GTNH_DELETE_BACKUPS: ${GTNH_DELETE_BACKUPS:-false}
+      SERVER_PORT: ${SERVER_PORT:-25565}
+      MAX_PLAYERS: ${MAX_PLAYERS:-10}
+      MOTD: ${MOTD:-GregTech New Horizons}
+      VIEW_DISTANCE: ${VIEW_DISTANCE:-10}
+      SIMULATION_DISTANCE: ${SIMULATION_DISTANCE:-10}
+      ONLINE_MODE: ${ONLINE_MODE:-true}
+      PVP: ${PVP:-true}
+      SPAWN_PROTECTION: ${SPAWN_PROTECTION:-0}
+      DIFFICULTY: ${DIFFICULTY:-hard}
+      ALLOW_FLIGHT: ${ALLOW_FLIGHT:-true}
+      ENABLE_COMMAND_BLOCK: ${ENABLE_COMMAND_BLOCK:-true}
+      ENABLE_QUERY: ${ENABLE_QUERY:-false}
+      QUERY_PORT: ${QUERY_PORT:-25565}
+      ENABLE_RCON: "true"
+      RCON_PORT: ${RCON_PORT:-25575}
+      RCON_PASSWORD: ${RCON_PASSWORD:?Set a secure RCON_PASSWORD in Coolify or your env file}
+      OPS: ${OPS:-}
+      ENABLE_WHITELIST: ${ENABLE_WHITELIST:-true}
+      ENFORCE_WHITELIST: ${ENFORCE_WHITELIST:-true}
+      LEVEL_TYPE: ${LEVEL_TYPE:-rwg}
+    ports:
+      - "${MC_PORT:-25565}:${SERVER_PORT:-25565}/tcp"
+      - "${QUERY_PORT:-25565}:${QUERY_PORT:-25565}/udp"
+    volumes:
+      - gtnh-data:/data
+    healthcheck:
+      test: ["CMD", "mc-health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 15m
+
+volumes:
+  gtnh-data:
