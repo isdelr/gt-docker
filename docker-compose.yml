@@ -32,7 +32,6 @@ services:
       ENABLE_RCON: "true"
       RCON_PORT: ${RCON_PORT:-25575}
       RCON_PASSWORD: ${RCON_PASSWORD:?Set a secure RCON_PASSWORD in Coolify or your env file}
-      OPS: ${OPS:-}
       ENABLE_WHITELIST: ${ENABLE_WHITELIST:-true}
       ENFORCE_WHITELIST: ${ENFORCE_WHITELIST:-true}
       LEVEL_TYPE: ${LEVEL_TYPE:-rwg}
