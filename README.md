@@ -58,13 +58,13 @@ On VPS reboot, Docker should signal the container, the wrapper should send a nor
 
 The `gtnh-backups` service uses `itzg/mc-backup` and RCON, so backups are coordinated with `save-off`, `save-all`, and `save-on` rather than copying a hot world without warning. It writes tar backups to the `gtnh-backups` Docker volume, mounted read-only into the Minecraft container at `/backups`.
 
-The startup wrapper also scans GTNH's existing zip backups under `/data/backups`, such as:
+The startup wrapper checks the active world's `level.dat` before Java starts, then also scans the previous startup log. It restores from GTNH's existing zip backups under `/data/backups`, such as:
 
 ```text
 /data/backups/2026-04-21-23-04-53.zip
 ```
 
-If the previous startup log contains:
+If `World/level.dat` is empty/unreadable, or if the previous startup log contains:
 
 ```text
 Forge Mod Loader detected that the backup level.dat is being used
@@ -72,12 +72,13 @@ Forge Mod Loader detected that the backup level.dat is being used
 
 then the next container start restores the newest usable backup from `/backups` or `/data/backups`. The suspect world is moved to `/data/.gtnh-recovery/failed-worlds/`, and the triggering log is moved to `/data/.gtnh-recovery/` so the server does not keep restoring from the same old warning.
 
-The compose file also appends `-Dfml.queryResult=cancel` to `JVM_OPTS`. That makes Forge stop instead of waiting forever at the prompt or continuing against a possibly damaged world. With `restart: unless-stopped`, Docker starts the container again; the wrapper sees the warning, restores a backup, and then launches normally.
+The compose file also sets `JVM_DD_OPTS=fml.queryResult:cancel`. That makes Forge stop instead of waiting forever at the prompt or continuing against a possibly damaged world. With `restart: unless-stopped`, Docker starts the container again; the wrapper sees the corrupt `level.dat` or warning, restores a backup, and then launches normally.
 
 Useful recovery knobs:
 
 ```text
 AUTO_RESTORE_ON_FML_LEVELDAT_WARNING=true
+AUTO_RESTORE_ON_CORRUPT_LEVELDAT=true
 AUTO_RESTORE_BACKUP_DIRS=/backups /data/backups
 AUTO_RESTORE_BACKUP_MAX_DEPTH=4
 BACKUP_INTERVAL=2h

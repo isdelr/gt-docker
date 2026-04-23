@@ -7,6 +7,7 @@ RECOVERY_DIR="${DATA_DIR}/.gtnh-recovery"
 BACKUP_DIRS="${AUTO_RESTORE_BACKUP_DIRS:-/backups /data/backups}"
 BACKUP_MAX_DEPTH="${AUTO_RESTORE_BACKUP_MAX_DEPTH:-4}"
 WARNING_PATTERN="${AUTO_RESTORE_FML_PATTERN:-Forge Mod Loader detected that the backup level.dat is being used}"
+EOF_PATTERN="${AUTO_RESTORE_EOF_PATTERN:-Exception reading ./World/level.dat}"
 MARKER_FILE="${RECOVERY_DIR}/last-restore.marker"
 
 log() {
@@ -89,6 +90,25 @@ extract_archive() {
   esac
 }
 
+gzip_file_is_readable() {
+  file_path="$1"
+
+  [ -f "$file_path" ] || return 1
+  [ -s "$file_path" ] || return 1
+
+  if command -v gzip >/dev/null 2>&1; then
+    gzip -t "$file_path" >/dev/null 2>&1
+    return $?
+  fi
+
+  if command -v gunzip >/dev/null 2>&1; then
+    gunzip -t "$file_path" >/dev/null 2>&1
+    return $?
+  fi
+
+  return 0
+}
+
 find_extracted_world() {
   extracted_dir="$1"
   wanted_world="$2"
@@ -161,6 +181,12 @@ restore_from_backup() {
     return 1
   fi
 
+  if ! gzip_file_is_readable "${source_world}/level.dat"; then
+    log "Backup has an unreadable level.dat, skipping: $archive"
+    rm -rf "$extract_dir"
+    return 1
+  fi
+
   if [ -e "$target_world" ]; then
     mv "$target_world" "$replaced_world"
     log "Moved the suspect world to: $replaced_world"
@@ -188,37 +214,23 @@ restore_from_backup() {
   log "Restore complete; starting Minecraft with restored world."
 }
 
-maybe_restore_after_fml_warning() {
-  is_true "${AUTO_RESTORE_ON_FML_LEVELDAT_WARNING:-true}" || return 0
-  [ -f "$LATEST_LOG" ] || return 0
-  grep -Fq "$WARNING_PATTERN" "$LATEST_LOG" || return 0
+restore_newest_backup() {
+  reason="$1"
 
   mkdir -p "$RECOVERY_DIR"
-
-  latest_log_mtime="$(mtime "$LATEST_LOG")"
-  last_restore_epoch="0"
   last_restored_backup=""
-
-  if [ -f "$MARKER_FILE" ]; then
-    last_restore_epoch="$(sed -n 's/^restored_at_epoch=//p' "$MARKER_FILE" | tail -n 1)"
-    last_restored_backup="$(sed -n 's/^backup=//p' "$MARKER_FILE" | tail -n 1)"
-  fi
-
-  case "$last_restore_epoch" in
-    ''|*[!0-9]*) last_restore_epoch="0" ;;
-  esac
-
-  if [ "$latest_log_mtime" -le "$last_restore_epoch" ]; then
-    log "Ignoring an old FML level.dat warning that predates the last restore."
-    return 0
-  fi
 
   candidates_file="${RECOVERY_DIR}/backup-candidates.$$"
   sorted_file="${RECOVERY_DIR}/backup-candidates-sorted.$$"
+
+  if [ -f "$MARKER_FILE" ]; then
+    last_restored_backup="$(sed -n 's/^backup=//p' "$MARKER_FILE" | tail -n 1)"
+  fi
+
   collect_backup_candidates "$candidates_file"
 
   if [ ! -s "$candidates_file" ]; then
-    log "FML level.dat warning found, but no backups were found in: $BACKUP_DIRS"
+    log "$reason, but no backups were found in: $BACKUP_DIRS"
     rm -f "$candidates_file" "$sorted_file"
     return 0
   fi
@@ -229,7 +241,7 @@ maybe_restore_after_fml_warning() {
     [ -n "$backup_file" ] || continue
 
     if [ "$backup_file" = "$last_restored_backup" ]; then
-      log "Skipping backup that was already restored and still led to an FML warning: $backup_file"
+      log "Skipping backup that was already restored and still led to startup failure: $backup_file"
       continue
     fi
 
@@ -240,9 +252,48 @@ maybe_restore_after_fml_warning() {
   done < "$sorted_file"
 
   rm -f "$candidates_file" "$sorted_file"
-  log "FML level.dat warning found, but none of the discovered backups could be restored."
+  log "$reason, but none of the discovered backups could be restored."
 }
 
-maybe_restore_after_fml_warning
+level_dat_is_corrupt() {
+  current_world="$(world_name)"
+  if [ -z "$current_world" ]; then
+    current_world="world"
+  fi
+
+  level_dat="${DATA_DIR}/${current_world}/level.dat"
+  [ -f "$level_dat" ] || return 1
+
+  if ! gzip_file_is_readable "$level_dat"; then
+    log "Detected unreadable gzip/NBT level.dat: $level_dat"
+    return 0
+  fi
+
+  return 1
+}
+
+maybe_restore_corrupt_level_dat() {
+  is_true "${AUTO_RESTORE_ON_CORRUPT_LEVELDAT:-true}" || return 0
+  if level_dat_is_corrupt; then
+    restore_newest_backup "Corrupt level.dat detected before Minecraft startup"
+  fi
+}
+
+maybe_restore_after_log_warning() {
+  is_true "${AUTO_RESTORE_ON_FML_LEVELDAT_WARNING:-true}" || return 0
+  [ -f "$LATEST_LOG" ] || return 0
+
+  if grep -Fq "$WARNING_PATTERN" "$LATEST_LOG"; then
+    restore_newest_backup "FML level.dat warning found in latest.log"
+    return 0
+  fi
+
+  if grep -Fq "$EOF_PATTERN" "$LATEST_LOG" && grep -Fq "java.io.EOFException" "$LATEST_LOG"; then
+    restore_newest_backup "level.dat EOFException found in latest.log"
+  fi
+}
+
+maybe_restore_corrupt_level_dat
+maybe_restore_after_log_warning
 
 exec /start "$@"
