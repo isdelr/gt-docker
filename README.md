@@ -9,6 +9,9 @@ By default it is configured to:
 - allocate `16G` of Java heap
 - keep the whitelist enabled from first boot
 - keep RCON enabled for terminal-based administration without publishing the RCON port externally
+- give the server up to five minutes to stop cleanly when Docker or the VPS shuts down
+- take RCON-coordinated sidecar backups every two hours
+- auto-cancel the Forge `backup level.dat` warning, restore the newest backup, and start again
 
 ## Official GTNH links
 
@@ -22,6 +25,8 @@ As of April 9, 2026, the GTNH downloads page and stable mirror both indicate `2.
 ## Files
 
 - `docker-compose.yml`: the deployable Coolify/Compose stack
+- `Dockerfile`: tiny wrapper around `itzg/minecraft-server` for startup recovery
+- `docker/gtnh-entrypoint.sh`: detects the Forge `backup level.dat` warning and restores a backup before launching Minecraft
 - `.env.example`: envs you can copy into Coolify or a local `.env`
 
 ## Deploying in Coolify
@@ -39,6 +44,47 @@ Coolify treats `docker-compose.yml` as the source of truth, and it auto-detects 
 - `ENABLE_WHITELIST=true` and `ENFORCE_WHITELIST=true` means nobody can join until you add them.
 - The Minecraft TCP port is mapped with `MC_PORT`, while the in-game server binds to `SERVER_PORT`.
 - Query is off by default. If you enable it, the compose file already maps the configured UDP query port.
+
+## Graceful shutdown
+
+The stack now sets both sides of the shutdown timeout:
+
+- `STOP_DURATION=300` tells the `itzg/minecraft-server` process wrapper to wait up to five minutes after sending the server `stop` command.
+- `stop_grace_period=6m` gives Docker longer than that before it sends a hard kill.
+
+On VPS reboot, Docker should signal the container, the wrapper should send a normal Minecraft stop, and Forge/GTNH should flush world data before the container exits.
+
+## Backups and auto-recovery
+
+The `gtnh-backups` service uses `itzg/mc-backup` and RCON, so backups are coordinated with `save-off`, `save-all`, and `save-on` rather than copying a hot world without warning. It writes tar backups to the `gtnh-backups` Docker volume, mounted read-only into the Minecraft container at `/backups`.
+
+The startup wrapper also scans GTNH's existing zip backups under `/data/backups`, such as:
+
+```text
+/data/backups/2026-04-21-23-04-53.zip
+```
+
+If the previous startup log contains:
+
+```text
+Forge Mod Loader detected that the backup level.dat is being used
+```
+
+then the next container start restores the newest usable backup from `/backups` or `/data/backups`. The suspect world is moved to `/data/.gtnh-recovery/failed-worlds/`, and the triggering log is moved to `/data/.gtnh-recovery/` so the server does not keep restoring from the same old warning.
+
+The compose file also appends `-Dfml.queryResult=cancel` to `JVM_OPTS`. That makes Forge stop instead of waiting forever at the prompt or continuing against a possibly damaged world. With `restart: unless-stopped`, Docker starts the container again; the wrapper sees the warning, restores a backup, and then launches normally.
+
+Useful recovery knobs:
+
+```text
+AUTO_RESTORE_ON_FML_LEVELDAT_WARNING=true
+AUTO_RESTORE_BACKUP_DIRS=/backups /data/backups
+AUTO_RESTORE_BACKUP_MAX_DEPTH=4
+BACKUP_INTERVAL=2h
+PRUNE_BACKUPS_DAYS=14
+```
+
+If the newest backup also triggers the same Forge warning, the wrapper skips that already-restored archive on the following restart and tries the next newest backup.
 
 ## Whitelist and admin commands
 
@@ -59,6 +105,7 @@ stop
 ## Best-practice notes for this stack
 
 - Keep `/data` on a persistent named volume so worlds and configs survive redeploys.
+- Keep the `gtnh-backups` volume persistent too; it is separate from the Minecraft data volume on purpose.
 - Leave RCON enabled for controlled administration, but do not expose `25575` publicly unless you have a specific need and a strong password.
 - Keep some host RAM free above the Java heap. `MEMORY=16G` sets only the JVM heap, not the total container footprint.
 - Leave GTNH defaults in place unless you have a specific reason to change them: `LEVEL_TYPE=rwg`, `DIFFICULTY=hard`, `ALLOW_FLIGHT=true`, and `ENABLE_COMMAND_BLOCK=true`.

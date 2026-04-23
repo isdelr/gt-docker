@@ -1,9 +1,14 @@
 services:
   gtnh:
-    image: itzg/minecraft-server:${MC_IMAGE_TAG:-java25}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MC_IMAGE_TAG: ${MC_IMAGE_TAG:-java25}
+    image: ${GTNH_IMAGE_NAME:-gtnh-minecraft-server}:${MC_IMAGE_TAG:-java25}
     container_name: ${CONTAINER_NAME:-gtnh}
     restart: unless-stopped
-    stop_grace_period: 2m
+    stop_grace_period: ${STOP_GRACE_PERIOD:-6m}
     stdin_open: true
     tty: true
     environment:
@@ -13,6 +18,12 @@ services:
       UID: ${UID:-1000}
       GID: ${GID:-1000}
       MEMORY: ${MEMORY:-16G}
+      STOP_DURATION: ${STOP_DURATION:-300}
+      STOP_SERVER_ANNOUNCE_DELAY: ${STOP_SERVER_ANNOUNCE_DELAY:-0}
+      JVM_OPTS: "${JVM_OPTS:-} -Dfml.queryResult=cancel"
+      AUTO_RESTORE_ON_FML_LEVELDAT_WARNING: ${AUTO_RESTORE_ON_FML_LEVELDAT_WARNING:-true}
+      AUTO_RESTORE_BACKUP_DIRS: ${AUTO_RESTORE_BACKUP_DIRS:-/backups /data/backups}
+      AUTO_RESTORE_BACKUP_MAX_DEPTH: ${AUTO_RESTORE_BACKUP_MAX_DEPTH:-4}
       GTNH_PACK_VERSION: ${GTNH_PACK_VERSION:-latest}
       SKIP_GTNH_UPDATE_CHECK: ${SKIP_GTNH_UPDATE_CHECK:-false}
       GTNH_DELETE_BACKUPS: ${GTNH_DELETE_BACKUPS:-false}
@@ -40,6 +51,7 @@ services:
       - "${QUERY_PORT:-25565}:${QUERY_PORT:-25565}/udp"
     volumes:
       - gtnh-data:/data
+      - gtnh-backups:/backups:ro
     healthcheck:
       test: ["CMD", "mc-health"]
       interval: 30s
@@ -47,5 +59,26 @@ services:
       retries: 20
       start_period: 15m
 
+  gtnh-backups:
+    image: itzg/mc-backup:${MC_BACKUP_IMAGE_TAG:-latest}
+    container_name: ${BACKUP_CONTAINER_NAME:-gtnh-backups}
+    restart: unless-stopped
+    depends_on:
+      gtnh:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-America/Santo_Domingo}
+      BACKUP_NAME: ${BACKUP_NAME:-gtnh}
+      BACKUP_INTERVAL: ${BACKUP_INTERVAL:-2h}
+      INITIAL_DELAY: ${BACKUP_INITIAL_DELAY:-0}
+      PRUNE_BACKUPS_DAYS: ${PRUNE_BACKUPS_DAYS:-14}
+      RCON_HOST: gtnh
+      RCON_PORT: ${RCON_PORT:-25575}
+      RCON_PASSWORD: ${RCON_PASSWORD:?Set a secure RCON_PASSWORD in Coolify or your env file}
+    volumes:
+      - gtnh-data:/data:ro
+      - gtnh-backups:/backups
+
 volumes:
   gtnh-data:
+  gtnh-backups:
