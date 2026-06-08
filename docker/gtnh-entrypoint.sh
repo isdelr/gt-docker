@@ -9,9 +9,25 @@ BACKUP_MAX_DEPTH="${AUTO_RESTORE_BACKUP_MAX_DEPTH:-4}"
 WARNING_PATTERN="${AUTO_RESTORE_FML_PATTERN:-Forge Mod Loader detected that the backup level.dat is being used}"
 EOF_PATTERN="${AUTO_RESTORE_EOF_PATTERN:-Exception reading ./World/level.dat}"
 MARKER_FILE="${RECOVERY_DIR}/last-restore.marker"
+CUSTOM_GTNH_DEPLOY_SCRIPT="${CUSTOM_GTNH_DEPLOY_SCRIPT:-/usr/local/share/gtnh/start-deployGTNH}"
+CUSTOM_GTNH_RESOLVER_MARKER="custom-gtnh-resolver-20260608"
 
 log() {
   echo "[gtnh-recovery] $*"
+}
+
+install_custom_gtnh_deploy() {
+  [ -f "$CUSTOM_GTNH_DEPLOY_SCRIPT" ] || return 0
+
+  if ! grep -Fq "$CUSTOM_GTNH_RESOLVER_MARKER" "$CUSTOM_GTNH_DEPLOY_SCRIPT"; then
+    log "Custom GTNH deploy script is present but missing marker: $CUSTOM_GTNH_DEPLOY_SCRIPT"
+    return 0
+  fi
+
+  cp "$CUSTOM_GTNH_DEPLOY_SCRIPT" /start-deployGTNH
+  cp "$CUSTOM_GTNH_DEPLOY_SCRIPT" /usr/local/bin/start-deployGTNH
+  chmod +x /start-deployGTNH /usr/local/bin/start-deployGTNH
+  log "Installed custom GTNH deploy resolver: $CUSTOM_GTNH_RESOLVER_MARKER"
 }
 
 is_true() {
@@ -293,6 +309,7 @@ maybe_restore_after_log_warning() {
   fi
 }
 
+install_custom_gtnh_deploy
 maybe_restore_corrupt_level_dat
 maybe_restore_after_log_warning
 
