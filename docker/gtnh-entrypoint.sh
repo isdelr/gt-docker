@@ -25,6 +25,55 @@ mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
 }
 
+server_properties_world_name() {
+  [ -f "${DATA_DIR}/server.properties" ] || return 1
+
+  world="$(
+    sed -n 's/^level-name=//p' "${DATA_DIR}/server.properties" \
+      | tr -d '\r' \
+      | tail -n 1
+  )"
+
+  [ -n "$world" ] || return 1
+  printf '%s\n' "$world"
+}
+
+log_world_name() {
+  [ -f "$LATEST_LOG" ] || return 1
+
+  world="$(
+    sed -n '/Exception reading \.\//{
+      s#.*Exception reading \./##
+      s#/level\.dat.*##
+      p
+    }' "$LATEST_LOG" \
+      | tail -n 1
+  )"
+
+  [ -n "$world" ] || return 1
+  printf '%s\n' "$world"
+}
+
+existing_world_name() {
+  [ -d "$DATA_DIR" ] || return 1
+
+  if [ -f "${DATA_DIR}/World/level.dat" ]; then
+    printf '%s\n' "World"
+    return
+  fi
+
+  if [ -f "${DATA_DIR}/world/level.dat" ]; then
+    printf '%s\n' "world"
+    return
+  fi
+
+  level_file="$(find "$DATA_DIR" -mindepth 2 -maxdepth 2 -type f -name level.dat 2>/dev/null | head -n 1 || true)"
+  [ -n "$level_file" ] || return 1
+
+  world_dir="${level_file%/level.dat}"
+  printf '%s\n' "${world_dir##*/}"
+}
+
 world_name() {
   if [ -n "${LEVEL_NAME:-}" ]; then
     printf '%s\n' "$LEVEL_NAME"
@@ -36,8 +85,18 @@ world_name() {
     return
   fi
 
-  if [ -f "${DATA_DIR}/server.properties" ]; then
-    sed -n 's/^level-name=//p' "${DATA_DIR}/server.properties" | tr -d '\r' | tail -n 1
+  if world="$(server_properties_world_name)"; then
+    printf '%s\n' "$world"
+    return
+  fi
+
+  if world="$(log_world_name)"; then
+    printf '%s\n' "$world"
+    return
+  fi
+
+  if world="$(existing_world_name)"; then
+    printf '%s\n' "$world"
     return
   fi
 
