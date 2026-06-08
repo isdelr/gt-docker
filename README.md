@@ -12,7 +12,8 @@ By default it is configured to:
 - keep RCON enabled for terminal-based administration without publishing the RCON port externally
 - give the server up to five minutes to stop cleanly when Docker or the VPS shuts down
 - take RCON-coordinated sidecar backups every two hours after an initial startup delay
-- auto-cancel the Forge `backup level.dat` warning, restore the newest backup, and start again
+- auto-confirm Forge startup queries by default, including missing block/item removals
+- detect the Forge `backup level.dat` warning, restore the newest backup, and start again
 
 ## Official GTNH links
 
@@ -99,21 +100,22 @@ The startup wrapper checks the active world's `level.dat` before Java starts, th
 /data/backups/2026-04-21-23-04-53.zip
 ```
 
-If the active world's `level.dat` is empty/unreadable, or if the previous startup log contains:
+If `World/level.dat` is empty/unreadable, or if the previous startup log contains:
 
 ```text
 Forge Mod Loader detected that the backup level.dat is being used
 ```
 
-then the next container start restores the newest usable backup from `/backups` or `/data/backups`. The wrapper resolves the active world name from `LEVEL_NAME`, `LEVEL`, `server.properties`, the previous Forge log, or an existing top-level `level.dat` folder, so GTNH worlds named `World` are restored back to `World` rather than accidentally creating a separate `world` folder. The suspect world is moved to `/data/.gtnh-recovery/failed-worlds/`, and the triggering log is moved to `/data/.gtnh-recovery/` so the server does not keep restoring from the same old warning.
+then the next container start restores the newest usable backup from `/backups` or `/data/backups`. The suspect world is moved to `/data/.gtnh-recovery/failed-worlds/`, and the triggering log is moved to `/data/.gtnh-recovery/` so the server does not keep restoring from the same old warning.
 
-The compose file also sets `JVM_DD_OPTS=fml.queryResult:cancel`. That makes Forge stop instead of waiting forever at the prompt or continuing against a possibly damaged world. With `restart: unless-stopped`, Docker starts the container again; the wrapper sees the corrupt `level.dat` or warning, restores a backup, and then launches normally.
+The startup wrapper sets `fml.queryResult=confirm` by default through `AUTO_CONFIRM_FORGE_QUERIES=true`. This accepts Forge startup queries, including the missing block/item mapping prompt where Forge removes the missing entries from the world. Set `AUTO_CONFIRM_FORGE_QUERIES=false` to disable the automatic answer, or set `JVM_DD_OPTS` yourself to override it.
 
 Useful recovery knobs:
 
 ```text
 AUTO_RESTORE_ON_FML_LEVELDAT_WARNING=true
 AUTO_RESTORE_ON_CORRUPT_LEVELDAT=true
+AUTO_CONFIRM_FORGE_QUERIES=true
 AUTO_RESTORE_BACKUP_DIRS=/backups /data/backups
 AUTO_RESTORE_BACKUP_MAX_DEPTH=4
 BACKUP_INTERVAL=2h
@@ -145,7 +147,7 @@ stop
 - Keep the `gtnh-backups` volume persistent too; it is separate from the Minecraft data volume on purpose.
 - Leave RCON enabled for controlled administration, but do not expose `25575` publicly unless you have a specific need and a strong password.
 - Keep some host RAM free above the Java heap. `MEMORY=16G` sets only the JVM heap, not the total container footprint.
-- Leave GTNH defaults in place unless you have a specific reason to change them: `LEVEL_TYPE=rwg`, `DIFFICULTY=hard`, `ALLOW_FLIGHT=true`, `ENABLE_COMMAND_BLOCK=true`, `VIEW_DISTANCE=10`, and `SIMULATION_DISTANCE=10`.
+- Leave GTNH defaults in place unless you have a specific reason to change them: `LEVEL_TYPE=rwg`, `DIFFICULTY=hard`, `ALLOW_FLIGHT=true`, and `ENABLE_COMMAND_BLOCK=true`.
 - If you want predictable updates, replace `GTNH_PACK_VERSION=latest` with a pinned version such as `2.8.4` or `2.9.0-beta-1`.
 - Expect first boot and some later startups to take a while; the healthcheck uses a long `start_period` to avoid false failures during install and mod loading.
 
