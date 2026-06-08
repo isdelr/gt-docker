@@ -5,6 +5,8 @@
 
 # This is the upstream GTNH deploy flow with an extended resolver for exact
 # pinned versions that are available on the mirror before versions.json updates.
+CUSTOM_GTNH_RESOLVER_MARKER="custom-gtnh-resolver-20260608"
+log "Using custom GTNH resolver override: ${CUSTOM_GTNH_RESOLVER_MARKER}"
 
 function packVersion(){
   basename "$1" | grep -Eo '[0-9]+(\.[0-9]+)+' | head -n 1 || true
