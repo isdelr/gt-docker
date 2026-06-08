@@ -12,7 +12,6 @@ By default it is configured to:
 - keep RCON enabled for terminal-based administration without publishing the RCON port externally
 - give the server up to five minutes to stop cleanly when Docker or the VPS shuts down
 - take RCON-coordinated sidecar backups every two hours after an initial startup delay
-- use a liveness healthcheck so Coolify does not reject slow GTNH installs or updates
 - auto-cancel the Forge `backup level.dat` warning, restore the newest backup, and start again
 
 ## Official GTNH links
@@ -92,17 +91,7 @@ On VPS reboot, Docker should signal the container, the wrapper should send a nor
 
 The `gtnh-backups` service uses `itzg/mc-backup` and RCON, so backups are coordinated with `save-off`, `save-all`, and `save-on` rather than copying a hot world without warning. It writes tar backups to the `gtnh-backups` Docker volume, mounted read-only into the Minecraft container at `/backups`.
 
-The backup sidecar waits for the Minecraft container to start, then uses `BACKUP_INITIAL_DELAY=30m` before its first backup. This avoids noisy RCON attempts while GTNH is still installing, updating, or loading mods.
-
-The Minecraft service deliberately uses a liveness healthcheck by default:
-
-```env
-GTNH_HEALTHCHECK_CMD=kill -0 1
-GTNH_HEALTHCHECK_START_PERIOD=2h
-GTNH_HEALTHCHECK_RETRIES=120
-```
-
-This tells Coolify and Docker that a running GTNH install/update process is alive even before Minecraft accepts connections. Use `mc-health` manually when you want a true Minecraft readiness check after startup.
+The backup sidecar waits for the Minecraft container to start, then uses `BACKUP_INITIAL_DELAY=15m` before its first backup. This avoids making Coolify deployments fail while GTNH is still installing, updating, or waiting to become fully healthy.
 
 The startup wrapper checks the active world's `level.dat` before Java starts, then also scans the previous startup log. It restores from GTNH's existing zip backups under `/data/backups`, such as:
 
@@ -128,7 +117,7 @@ AUTO_RESTORE_ON_CORRUPT_LEVELDAT=true
 AUTO_RESTORE_BACKUP_DIRS=/backups /data/backups
 AUTO_RESTORE_BACKUP_MAX_DEPTH=4
 BACKUP_INTERVAL=2h
-BACKUP_INITIAL_DELAY=30m
+BACKUP_INITIAL_DELAY=15m
 PRUNE_BACKUPS_DAYS=14
 ```
 
@@ -158,7 +147,7 @@ stop
 - Keep some host RAM free above the Java heap. `MEMORY=16G` sets only the JVM heap, not the total container footprint.
 - Leave GTNH defaults in place unless you have a specific reason to change them: `LEVEL_TYPE=rwg`, `DIFFICULTY=hard`, `ALLOW_FLIGHT=true`, and `ENABLE_COMMAND_BLOCK=true`.
 - If you want predictable updates, replace `GTNH_PACK_VERSION=latest` with a pinned version such as `2.8.4` or `2.9.0-beta-1`.
-- Expect first boot and some later startups to take a while; the default healthcheck is a liveness check so Coolify does not fail the deployment before GTNH finishes installing and mod loading.
+- Expect first boot and some later startups to take a while; the healthcheck uses a long `start_period` to avoid false failures during install and mod loading.
 
 ## Local validation
 
