@@ -11,7 +11,7 @@ By default it is configured to:
 - keep the whitelist enabled from first boot
 - keep RCON enabled for terminal-based administration without publishing the RCON port externally
 - give the server up to five minutes to stop cleanly when Docker or the VPS shuts down
-- take RCON-coordinated sidecar backups every two hours
+- take RCON-coordinated sidecar backups every two hours after an initial startup delay
 - auto-cancel the Forge `backup level.dat` warning, restore the newest backup, and start again
 
 ## Official GTNH links
@@ -91,6 +91,8 @@ On VPS reboot, Docker should signal the container, the wrapper should send a nor
 
 The `gtnh-backups` service uses `itzg/mc-backup` and RCON, so backups are coordinated with `save-off`, `save-all`, and `save-on` rather than copying a hot world without warning. It writes tar backups to the `gtnh-backups` Docker volume, mounted read-only into the Minecraft container at `/backups`.
 
+The backup sidecar waits for the Minecraft container to start, then uses `BACKUP_INITIAL_DELAY=15m` before its first backup. This avoids making Coolify deployments fail while GTNH is still installing, updating, or waiting to become fully healthy.
+
 The startup wrapper checks the active world's `level.dat` before Java starts, then also scans the previous startup log. It restores from GTNH's existing zip backups under `/data/backups`, such as:
 
 ```text
@@ -115,6 +117,7 @@ AUTO_RESTORE_ON_CORRUPT_LEVELDAT=true
 AUTO_RESTORE_BACKUP_DIRS=/backups /data/backups
 AUTO_RESTORE_BACKUP_MAX_DEPTH=4
 BACKUP_INTERVAL=2h
+BACKUP_INITIAL_DELAY=15m
 PRUNE_BACKUPS_DAYS=14
 ```
 

@@ -68,12 +68,12 @@ services:
     restart: unless-stopped
     depends_on:
       gtnh:
-        condition: service_healthy
+        condition: service_started
     environment:
       TZ: ${TZ:-America/Santo_Domingo}
       BACKUP_NAME: ${BACKUP_NAME:-gtnh}
       BACKUP_INTERVAL: ${BACKUP_INTERVAL:-2h}
-      INITIAL_DELAY: ${BACKUP_INITIAL_DELAY:-0}
+      INITIAL_DELAY: ${BACKUP_INITIAL_DELAY:-15m}
       PRUNE_BACKUPS_DAYS: ${PRUNE_BACKUPS_DAYS:-14}
       RCON_HOST: gtnh
       RCON_PORT: ${RCON_PORT:-25575}
