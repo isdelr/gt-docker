@@ -6,6 +6,7 @@ By default it is configured to:
 
 - track the latest full stable GTNH release with `GTNH_PACK_VERSION=latest`
 - use Java 25 (`MC_IMAGE_TAG=java25`), which the GTNH container docs recommend for GTNH `2.8.0+`
+- bridge GTNH download metadata gaps for pinned versions such as beta releases
 - allocate `16G` of Java heap
 - keep the whitelist enabled from first boot
 - keep RCON enabled for terminal-based administration without publishing the RCON port externally
@@ -25,8 +26,9 @@ As of April 9, 2026, the GTNH downloads page and stable mirror both indicate `2.
 ## Files
 
 - `docker-compose.yml`: the deployable Coolify/Compose stack
-- `Dockerfile`: tiny wrapper around `itzg/minecraft-server` for startup recovery
+- `Dockerfile`: tiny wrapper around `itzg/minecraft-server` for startup recovery and the GTNH resolver override
 - `docker/gtnh-entrypoint.sh`: detects the Forge `backup level.dat` warning and restores a backup before launching Minecraft
+- `docker/start-deployGTNH`: keeps the GTNH cleanup update flow and adds fallback URL resolution for versions missing from GTNH metadata
 - `.env.example`: envs you can copy into Coolify or a local `.env`
 
 ## Deploying in Coolify
@@ -41,9 +43,40 @@ Coolify treats `docker-compose.yml` as the source of truth, and it auto-detects 
 ## Default behavior
 
 - `GTNH_PACK_VERSION=latest` means the container will install the latest full stable GTNH release and can update to newer stable releases on subsequent starts.
+- For predictable updates, pin `GTNH_PACK_VERSION` to a specific version. Exact pinned versions are first resolved through GTNH's official metadata; if missing, the image tries the standard official server archive URL.
+- `GTNH_PACK_URL` is optional. Set it only when a pinned version exists but the archive filename or location does not follow the standard GTNH pattern.
 - `ENABLE_WHITELIST=true` and `ENFORCE_WHITELIST=true` means nobody can join until you add them.
 - The Minecraft TCP port is mapped with `MC_PORT`, while the in-game server binds to `SERVER_PORT`.
 - Query is off by default. If you enable it, the compose file already maps the configured UDP query port.
+
+## GTNH version pinning
+
+For normal stable tracking, leave:
+
+```text
+GTNH_PACK_VERSION=latest
+GTNH_PACK_URL=
+```
+
+For a pinned beta or other exact version, set the version and leave `GTNH_PACK_URL` blank first:
+
+```text
+GTNH_PACK_VERSION=2.9.0-beta-1
+GTNH_PACK_URL=
+```
+
+The custom GTNH deploy script preserves the upstream cleanup update flow, including replacing `libraries`, `mods`, `resources`, `scripts`, server launch files, backing up `config`, restoring `JourneyMapServer`, and updating `/data/.gtnh-version`. The only intentional difference is download resolution: when `versions.json` does not list an exact pinned version, the script tries the standard official server archive URL, such as:
+
+```text
+https://downloads.gtnewhorizons.com/ServerPacks/betas/GT_New_Horizons_2.9.0-beta-1_Server_Java_17-25.zip
+```
+
+If a release uses a non-standard archive name or location, set the direct server archive URL:
+
+```text
+GTNH_PACK_VERSION=2.9.0-beta-1
+GTNH_PACK_URL=https://downloads.gtnewhorizons.com/ServerPacks/betas/GT_New_Horizons_2.9.0-beta-1_Server_Java_17-25.zip
+```
 
 ## Graceful shutdown
 
@@ -110,7 +143,7 @@ stop
 - Leave RCON enabled for controlled administration, but do not expose `25575` publicly unless you have a specific need and a strong password.
 - Keep some host RAM free above the Java heap. `MEMORY=16G` sets only the JVM heap, not the total container footprint.
 - Leave GTNH defaults in place unless you have a specific reason to change them: `LEVEL_TYPE=rwg`, `DIFFICULTY=hard`, `ALLOW_FLIGHT=true`, and `ENABLE_COMMAND_BLOCK=true`.
-- If you want predictable updates, replace `GTNH_PACK_VERSION=latest` with a pinned version such as `2.8.4`.
+- If you want predictable updates, replace `GTNH_PACK_VERSION=latest` with a pinned version such as `2.8.4` or `2.9.0-beta-1`.
 - Expect first boot and some later startups to take a while; the healthcheck uses a long `start_period` to avoid false failures during install and mod loading.
 
 ## Local validation
@@ -126,6 +159,7 @@ docker compose --env-file .env.example config
 - GTNH homepage: [https://www.gtnewhorizons.com/](https://www.gtnewhorizons.com/)
 - GTNH downloads: [https://www.gtnewhorizons.com/downloads/](https://www.gtnewhorizons.com/downloads/)
 - GTNH stable mirror: [https://downloads.gtnewhorizons.com/Latest/Stable/](https://downloads.gtnewhorizons.com/Latest/Stable/)
+- GTNH versions metadata: [https://downloads.gtnewhorizons.com/versions.json](https://downloads.gtnewhorizons.com/versions.json)
 - GTNH in the Docker image docs: [https://docker-minecraft-server.readthedocs.io/en/latest/types-and-platforms/mod-platforms/gtnh/](https://docker-minecraft-server.readthedocs.io/en/latest/types-and-platforms/mod-platforms/gtnh/)
 - Server properties and whitelist docs: [https://docker-minecraft-server.readthedocs.io/en/latest/configuration/server-properties/](https://docker-minecraft-server.readthedocs.io/en/latest/configuration/server-properties/)
 - JVM/memory docs: [https://docker-minecraft-server.readthedocs.io/en/latest/configuration/jvm-options/](https://docker-minecraft-server.readthedocs.io/en/latest/configuration/jvm-options/)
