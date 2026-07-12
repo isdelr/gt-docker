@@ -4,16 +4,19 @@ This stack runs GregTech New Horizons on top of [`itzg/minecraft-server`](https:
 
 By default it is configured to:
 
-- track the latest full stable GTNH release with `GTNH_PACK_VERSION=latest`
-- use Java 25 (`MC_IMAGE_TAG=java25`), which the GTNH container docs recommend for GTNH `2.8.0+`
-- bridge GTNH download metadata gaps for pinned versions such as beta releases
-- allocate `16G` of Java heap
+- pin GTNH `2.9.0-beta-2` and its matching Java 25 client pack
+- pin known `itzg/minecraft-server` and `itzg/mc-backup` image releases
+- allocate `12G` of Java heap so the 22 GiB host retains native-memory headroom
+- keep RCON private and share the image-generated credential through the data volume
+- allow nine minutes for Minecraft and ten minutes for Docker shutdown
+- keep 14 verified full backups at 12-hour intervals without recursively archiving backups
+- keep claimed-region ServerUtilities backups within a 35 GB cap
+- stop and quarantine the server when chunk-corruption signatures appear
+- disable automatic full-world restores and Forge query confirmation by default
+- disable optimized chunk compression and zlib pooling while chunk-save diagnostics are enabled
+- limit automatic Minecraft restart attempts to three
 - keep the whitelist enabled from first boot
-- keep RCON enabled for terminal-based administration without publishing the RCON port externally
-- give the server up to five minutes to stop cleanly when Docker or the VPS shuts down
-- take RCON-coordinated sidecar backups every two hours after an initial startup delay
-- auto-confirm Forge startup queries by default, including missing block/item removals
-- detect the Forge `backup level.dat` warning, restore the newest backup, and start again
+- bridge GTNH download metadata gaps for pinned releases
 
 ## Official GTNH links
 
@@ -22,28 +25,28 @@ By default it is configured to:
 - Stable mirror alias: [https://downloads.gtnewhorizons.com/Latest/Stable/](https://downloads.gtnewhorizons.com/Latest/Stable/)
 - Direct latest stable Java 17-25 server archive alias: [https://downloads.gtnewhorizons.com/Latest/Stable/Latest%20stable%20Java%2017-25%20server%20archive%20%28recommended%29.zip](https://downloads.gtnewhorizons.com/Latest/Stable/Latest%20stable%20Java%2017-25%20server%20archive%20%28recommended%29.zip)
 
-As of April 9, 2026, the GTNH downloads page and stable mirror both indicate `2.8.4` as the latest stable release. The stable Java 17-25 server archive on the official mirror is dated December 23, 2025.
 
 ## Files
 
 - `docker-compose.yml`: the deployable Coolify/Compose stack
 - `Dockerfile`: tiny wrapper around `itzg/minecraft-server` for startup recovery and the GTNH resolver override
-- `docker/gtnh-entrypoint.sh`: detects the Forge `backup level.dat` warning and restores a backup before launching Minecraft
-- `docker/start-deployGTNH`: keeps the GTNH cleanup update flow and adds fallback URL resolution for versions missing from GTNH metadata
+- `docker/gtnh-entrypoint.sh`: enforces corruption quarantine and retains opt-in level.dat recovery
+- `docker/gtnh-corruption-guard.sh`: records evidence and stops Minecraft on corruption
+- `docker/start-deployGTNH`: resolves releases and reapplies operational safety settings after upgrades
+- `ops/gtnh-graceful-shutdown*`: host shutdown hook and Docker stop helper
 - `.env.example`: envs you can copy into Coolify or a local `.env`
 
 ## Deploying in Coolify
 
 1. Create a new Docker Compose resource that points at this folder/repository.
 2. Paste the values from `.env.example` into Coolify's environment UI.
-3. Set a strong `RCON_PASSWORD` before deploying.
-4. Deploy the stack.
+3. Deploy the stack.
 
 Coolify treats `docker-compose.yml` as the source of truth, and it auto-detects `${VAR}` placeholders so those settings appear in the UI.
 
 ## Default behavior
 
-- `GTNH_PACK_VERSION=latest` means the container will install the latest full stable GTNH release and can update to newer stable releases on subsequent starts.
+- Production is pinned to `GTNH_PACK_VERSION=2.9.0-beta-2`; clients must use the matching pack.
 - For predictable updates, pin `GTNH_PACK_VERSION` to a specific version. Exact pinned versions are first resolved through GTNH's official metadata; if missing, the image tries the standard official server archive URL.
 - `GTNH_PACK_URL` is optional. Set it only when a pinned version exists but the archive filename or location does not follow the standard GTNH pattern.
 - `ENABLE_WHITELIST=true` and `ENFORCE_WHITELIST=true` means nobody can join until you add them.
@@ -55,75 +58,78 @@ Coolify treats `docker-compose.yml` as the source of truth, and it auto-detects 
 For normal stable tracking, leave:
 
 ```text
-GTNH_PACK_VERSION=latest
+GTNH_PACK_VERSION=2.9.0-beta-2
 GTNH_PACK_URL=
 ```
 
 For a pinned beta or other exact version, set the version and leave `GTNH_PACK_URL` blank first:
 
 ```text
-GTNH_PACK_VERSION=2.9.0-beta-1
+GTNH_PACK_VERSION=2.9.0-beta-2
 GTNH_PACK_URL=
 ```
 
 The custom GTNH deploy script preserves the upstream cleanup update flow, including replacing `libraries`, `mods`, `resources`, `scripts`, server launch files, backing up `config`, restoring `JourneyMapServer`, and updating `/data/.gtnh-version`. The only intentional difference is download resolution: when `versions.json` does not list an exact pinned version, the script tries the standard official server archive URL, such as:
 
 ```text
-https://downloads.gtnewhorizons.com/ServerPacks/betas/GT_New_Horizons_2.9.0-beta-1_Server_Java_17-25.zip
+https://downloads.gtnewhorizons.com/ServerPacks/betas/GT_New_Horizons_2.9.0-beta-2_Server_Java_17-25.zip
 ```
 
 If a release uses a non-standard archive name or location, set the direct server archive URL:
 
 ```text
-GTNH_PACK_VERSION=2.9.0-beta-1
-GTNH_PACK_URL=https://downloads.gtnewhorizons.com/ServerPacks/betas/GT_New_Horizons_2.9.0-beta-1_Server_Java_17-25.zip
+GTNH_PACK_VERSION=2.9.0-beta-2
+GTNH_PACK_URL=https://downloads.gtnewhorizons.com/ServerPacks/betas/GT_New_Horizons_2.9.0-beta-2_Server_Java_17-25.zip
 ```
 
 ## Graceful shutdown
 
-The stack now sets both sides of the shutdown timeout:
+The stack sets both sides of the shutdown timeout:
 
-- `STOP_DURATION=300` tells the `itzg/minecraft-server` process wrapper to wait up to five minutes after sending the server `stop` command.
-- `stop_grace_period=6m` gives Docker longer than that before it sends a hard kill.
+- `STOP_DURATION=540` gives the Minecraft wrapper nine minutes.
+- `stop_grace_period=10m` gives Docker one additional minute.
+- The installed systemd hook stops the labeled server container before Docker during normal reboot.
 
-On VPS reboot, Docker should signal the container, the wrapper should send a normal Minecraft stop, and Forge/GTNH should flush world data before the container exits.
+An OVH hard reset can bypass userspace shutdown hooks, so verified backups remain mandatory.
 
-## Backups and auto-recovery
+## Backups
 
-The `gtnh-backups` service uses `itzg/mc-backup` and RCON, so backups are coordinated with `save-off`, `save-all`, and `save-on` rather than copying a hot world without warning. It writes tar backups to the `gtnh-backups` Docker volume, mounted read-only into the Minecraft container at `/backups`.
+The `gtnh-backups` service waits for Minecraft health, loads the image-generated RCON credential from the shared `/data/.rcon-cli.env`, then coordinates `save-off`, `save-all`, and `save-on`. It runs every 12 hours and retains no more than 14 archives or seven days. Internal backup trees, recovery snapshots, upgrade snapshots, logs, caches, jars, and downloaded packs are excluded.
 
-The backup sidecar waits for the Minecraft container to start, then uses `BACKUP_INITIAL_DELAY=15m` before its first backup. This avoids making Coolify deployments fail while GTNH is still installing, updating, or waiting to become fully healthy.
+Each archive must pass `gzip -t`. Successful verification updates `/backups/.last-verified`, and the backup container becomes unhealthy when that marker is older than 13 hours.
 
-The startup wrapper checks the active world's `level.dat` before Java starts, then also scans the previous startup log. It restores from GTNH's existing zip backups under `/data/backups`, such as:
+ServerUtilities supplies the faster tier every 30 minutes using complete region files containing claimed chunks. It retains up to 48 archives within a 35 GB cap. Full sidecar archives and the VPS Backblaze snapshots protect unclaimed areas.
 
-```text
-/data/backups/2026-04-21-23-04-53.zip
-```
+Automatic full-world restoration is disabled by default because an unreviewed restore can erase unrelated progress. The prior implementation remains opt-in:
 
-If `World/level.dat` is empty/unreadable, or if the previous startup log contains:
-
-```text
-Forge Mod Loader detected that the backup level.dat is being used
-```
-
-then the next container start restores the newest usable backup from `/backups` or `/data/backups`. The suspect world is moved to `/data/.gtnh-recovery/failed-worlds/`, and the triggering log is moved to `/data/.gtnh-recovery/` so the server does not keep restoring from the same old warning.
-
-The startup wrapper sets `fml.queryResult=confirm` by default through `AUTO_CONFIRM_FORGE_QUERIES=true`. This accepts Forge startup queries, including the missing block/item mapping prompt where Forge removes the missing entries from the world. Set `AUTO_CONFIRM_FORGE_QUERIES=false` to disable the automatic answer, or set `JVM_DD_OPTS` yourself to override it.
-
-Useful recovery knobs:
-
-```text
-AUTO_RESTORE_ON_FML_LEVELDAT_WARNING=true
+```env
 AUTO_RESTORE_ON_CORRUPT_LEVELDAT=true
-AUTO_CONFIRM_FORGE_QUERIES=true
-AUTO_RESTORE_BACKUP_DIRS=/backups /data/backups
-AUTO_RESTORE_BACKUP_MAX_DEPTH=4
-BACKUP_INTERVAL=2h
-BACKUP_INITIAL_DELAY=15m
-PRUNE_BACKUPS_DAYS=14
+AUTO_RESTORE_ON_FML_LEVELDAT_WARNING=true
 ```
 
-If the newest backup also triggers the same Forge warning, the wrapper skips that already-restored archive on the following restart and tries the next newest backup.
+Do not enable automatic Forge query confirmation in production. Missing block or item mappings require operator review.
+
+## Corruption quarantine
+
+The runtime guard watches only new log lines for missing Level data, rejected chunk roots, malformed UTF, null chunks, and save failures. On detection it:
+
+1. copies the current log under `/data/.gtnh-recovery/`
+2. writes `corruption-detected.marker` atomically
+3. sends Minecraft a normal RCON `stop`
+4. blocks later startup until the affected chunk is inspected and restored
+
+After recovery, set `CORRUPTION_GUARD_CLEAR=true` for one start and then return it to `false`.
+
+Useful operational controls:
+
+```text
+CORRUPTION_GUARD_ENABLED=true
+GTNH_DISABLE_OPTIMIZED_CHUNK_COMPRESSION=true
+GTNH_CHUNK_SAVE_DEBUG=true
+BACKUP_INTERVAL=12h
+PRUNE_BACKUPS_COUNT=14
+PRUNE_BACKUPS_DAYS=7
+```
 
 ## Whitelist and admin commands
 
@@ -143,12 +149,13 @@ stop
 
 ## Best-practice notes for this stack
 
-- Keep `/data` on a persistent named volume so worlds and configs survive redeploys.
-- Keep the `gtnh-backups` volume persistent too; it is separate from the Minecraft data volume on purpose.
-- Leave RCON enabled for controlled administration, but do not expose `25575` publicly unless you have a specific need and a strong password.
-- Keep some host RAM free above the Java heap. `MEMORY=16G` sets only the JVM heap, not the total container footprint.
+- Keep `/data` and `/backups` on persistent named volumes.
+- Treat a missing or stale `.last-verified` marker as backup failure.
+- The backup volume shares the VPS disk; Backblaze B2 provides the off-site tier.
+- Leave RCON enabled for controlled administration and backup coordination, but do not expose its port publicly.
+- Keep host RAM free above the Java heap. `MEMORY=12G` is not the container's total use.
 - Leave GTNH defaults in place unless you have a specific reason to change them: `LEVEL_TYPE=rwg`, `DIFFICULTY=hard`, `ALLOW_FLIGHT=true`, and `ENABLE_COMMAND_BLOCK=true`.
-- If you want predictable updates, replace `GTNH_PACK_VERSION=latest` with a pinned version such as `2.8.4` or `2.9.0-beta-1`.
+- Upgrade the complete GTNH server and matching clients together; do not replace individual mod jars.
 - Expect first boot and some later startups to take a while; the healthcheck uses a long `start_period` to avoid false failures during install and mod loading.
 
 ## Local validation

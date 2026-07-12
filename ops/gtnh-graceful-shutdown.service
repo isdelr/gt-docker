@@ -1,0 +1,15 @@
+[Unit]
+Description=Gracefully stop GTNH before Docker shuts down
+Requires=docker.service
+After=docker.service
+Before=shutdown.target reboot.target halt.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+RemainAfterExit=yes
+ExecStop=/usr/local/sbin/gtnh-graceful-shutdown
+TimeoutStopSec=11min
+
+[Install]
+WantedBy=multi-user.target

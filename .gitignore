@@ -1,0 +1,4 @@
+.env
+rcon_password
+*.local
+*.secret

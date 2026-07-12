@@ -246,7 +246,7 @@ function updateGTNH(){
 }
 
 function handleGTNH() {
-  : "${GTNH_PACK_VERSION:=latest}"
+  : "${GTNH_PACK_VERSION:=2.9.0-beta-2}"
   : "${GTNH_DELETE_BACKUPS:=false}"
   : "${SKIP_GTNH_UPDATE_CHECK:=false}"
   : "${GTNH_PACK_URL:=}"
@@ -315,6 +315,46 @@ function handleGTNH() {
   fi
 }
 
+function setGTNHconfigValue() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+
+  if [[ ! -f "$file" ]]; then
+    logWarning "Safety override skipped because config is missing: $file"
+    return
+  fi
+
+  if ! grep -Eq "^[[:space:]]*$key=" "$file"; then
+    logWarning "Safety override key is missing from $file: $key"
+    return
+  fi
+
+  sed -i -E "s|^([[:space:]]*)$key=.*|\\1$key=$value|" "$file"
+  log "Applied safety override $key=$value in $file"
+}
+
+function applyGTNHSafetyOverrides() {
+  local hodgepodge="/data/config/hodgepodge.cfg"
+  local serverutilities="/data/serverutilities/serverutilities.cfg"
+
+  if isTrue "${GTNH_DISABLE_OPTIMIZED_CHUNK_COMPRESSION:-true}"; then
+    setGTNHconfigValue "$hodgepodge" "B:speedupChunkCompression" "false"
+    setGTNHconfigValue "$hodgepodge" "B:poolZlibInstances" "false"
+  fi
+
+  if isTrue "${GTNH_CHUNK_SAVE_DEBUG:-true}"; then
+    setGTNHconfigValue "$hodgepodge" "B:chunkSaveCMEDebug" "true"
+  fi
+
+  setGTNHconfigValue "$serverutilities" "S:backup_timer" "${GTNH_INTERNAL_BACKUP_TIMER:-0.5}"
+  setGTNHconfigValue "$serverutilities" "I:backups_to_keep" "${GTNH_INTERNAL_BACKUPS_TO_KEEP:-48}"
+  setGTNHconfigValue "$serverutilities" "I:max_folder_size" "${GTNH_INTERNAL_BACKUP_MAX_GB:-35}"
+  setGTNHconfigValue "$serverutilities" "I:compression_level" "${GTNH_INTERNAL_BACKUP_COMPRESSION:-4}"
+  setGTNHconfigValue "$serverutilities" "B:only_backup_claimed_chunks" "${GTNH_INTERNAL_BACKUP_CLAIMED_ONLY:-true}"
+  setGTNHconfigValue "$serverutilities" "B:backup_entire_regions_with_claims" "${GTNH_INTERNAL_BACKUP_WHOLE_REGIONS:-true}"
+}
+
 log "Applying GTNH optimized server defaults"
 export ALLOW_FLIGHT="${ALLOW_FLIGHT:=true}"
 export LEVEL_TYPE="${LEVEL_TYPE:=rwg}"
@@ -341,6 +381,7 @@ log "TYPE=GTNH, setting Minecraft version to 1.7.10"
 export VERSION=1.7.10
 
 handleGTNH
+applyGTNHSafetyOverrides
 
 export USES_MODS=true
 

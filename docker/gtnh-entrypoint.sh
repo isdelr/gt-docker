@@ -9,6 +9,7 @@ BACKUP_MAX_DEPTH="${AUTO_RESTORE_BACKUP_MAX_DEPTH:-4}"
 WARNING_PATTERN="${AUTO_RESTORE_FML_PATTERN:-Forge Mod Loader detected that the backup level.dat is being used}"
 EOF_PATTERN="${AUTO_RESTORE_EOF_PATTERN:-Exception reading ./World/level.dat}"
 MARKER_FILE="${RECOVERY_DIR}/last-restore.marker"
+CORRUPTION_MARKER_FILE="${RECOVERY_DIR}/corruption-detected.marker"
 
 log() {
   echo "[gtnh-recovery] $*"
@@ -45,7 +46,7 @@ world_name() {
 }
 
 maybe_auto_confirm_forge_queries() {
-  is_true "${AUTO_CONFIRM_FORGE_QUERIES:-true}" || return 0
+  is_true "${AUTO_CONFIRM_FORGE_QUERIES:-false}" || return 0
 
   case " ${JVM_DD_OPTS:-} " in
     *"fml.queryResult:"*) return 0 ;;
@@ -284,14 +285,14 @@ level_dat_is_corrupt() {
 }
 
 maybe_restore_corrupt_level_dat() {
-  is_true "${AUTO_RESTORE_ON_CORRUPT_LEVELDAT:-true}" || return 0
+  is_true "${AUTO_RESTORE_ON_CORRUPT_LEVELDAT:-false}" || return 0
   if level_dat_is_corrupt; then
     restore_newest_backup "Corrupt level.dat detected before Minecraft startup"
   fi
 }
 
 maybe_restore_after_log_warning() {
-  is_true "${AUTO_RESTORE_ON_FML_LEVELDAT_WARNING:-true}" || return 0
+  is_true "${AUTO_RESTORE_ON_FML_LEVELDAT_WARNING:-false}" || return 0
   [ -f "$LATEST_LOG" ] || return 0
 
   if grep -Fq "$WARNING_PATTERN" "$LATEST_LOG"; then
@@ -304,8 +305,30 @@ maybe_restore_after_log_warning() {
   fi
 }
 
+enforce_corruption_quarantine() {
+  [ -f "$CORRUPTION_MARKER_FILE" ] || return 0
+  if is_true "${CORRUPTION_GUARD_CLEAR:-false}"; then
+    cleared_at="$(date -u +%Y%m%dT%H%M%SZ)"
+    mv "$CORRUPTION_MARKER_FILE" "${CORRUPTION_MARKER_FILE}.cleared-${cleared_at}"
+    log "Cleared the corruption quarantine marker by explicit configuration."
+    return 0
+  fi
+  log "Refusing to start because a corruption quarantine marker exists:"
+  sed -n '1,20p' "$CORRUPTION_MARKER_FILE" 2>/dev/null || true
+  log "Inspect and restore the affected chunk, then set CORRUPTION_GUARD_CLEAR=true for one start."
+  exit 42
+}
+
+start_corruption_guard() {
+  is_true "${CORRUPTION_GUARD_ENABLED:-true}" || return 0
+  /usr/local/bin/gtnh-corruption-guard.sh &
+  log "Started the runtime chunk-corruption guard."
+}
+
+enforce_corruption_quarantine
 maybe_restore_corrupt_level_dat
 maybe_restore_after_log_warning
 maybe_auto_confirm_forge_queries
+start_corruption_guard
 
 exec /start "$@"
