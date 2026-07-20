@@ -1,25 +1,174 @@
 #!/bin/bash
 
 # shellcheck source=start-utils
-. "$(dirname "$0")/start-utils"
+. "$(dirname "${BASH_SOURCE[0]}")/start-utils"
 
-# This is the upstream GTNH deploy flow with an extended resolver for exact
-# pinned versions that are available on the mirror before versions.json updates.
-CUSTOM_GTNH_RESOLVER_MARKER="custom-gtnh-resolver-20260608"
+# This is the upstream GTNH deploy flow with exact release and tested daily
+# artifact support plus transactional updates for persistent servers.
+CUSTOM_GTNH_RESOLVER_MARKER="custom-gtnh-resolver-20260720"
 log "Using custom GTNH resolver override: ${CUSTOM_GTNH_RESOLVER_MARKER}"
 
-function packVersion(){
-  basename "$1" | grep -Eo '[0-9]+(\.[0-9]+)+' | head -n 1 || true
-}
-
-function packReleaseType(){
-  basename "$1" | grep -Eo '(beta|[Rr][Cc])(-?[0-9]+)?' | head -n 1 || true
-}
+GTNH_DAILY_REPOSITORY="${GTNH_DAILY_REPOSITORY:-GTNewHorizons/DreamAssemblerXXL}"
+GTNH_DAILY_WORKFLOW="${GTNH_DAILY_WORKFLOW:-daily-modpack-build.yml}"
+GTNH_GITHUB_API="${GTNH_GITHUB_API:-https://api.github.com}"
+GTNH_UPDATE_MARKER="/data/.gtnh-update-in-progress"
 
 function setGTNHdownloadPath(){
   gtnh_download_path="$1"
-  current_version="$(packVersion "$gtnh_download_path")"
-  current_release_type="$(packReleaseType "$gtnh_download_path")"
+  gtnh_selected_id="${2:-$(basename "$gtnh_download_path")}"
+  gtnh_download_kind="${3:-archive}"
+  gtnh_download_sha256="${4:-${GTNH_PACK_SHA256:-}}"
+  gtnh_download_size="${5:-}"
+}
+
+function isDailyGTNHpackVersion(){
+  [[ "${GTNH_PACK_VERSION:-}" == "daily" ||
+     "${GTNH_PACK_VERSION:-}" == "latest-daily" ||
+     "${GTNH_PACK_VERSION:-}" =~ ^daily-[0-9]{4}-[0-9]{2}-[0-9]{2}\+[0-9]+$ ]]
+}
+
+function isExactDailyGTNHpackVersion(){
+  [[ "${GTNH_PACK_VERSION:-}" =~ ^daily-[0-9]{4}-[0-9]{2}-[0-9]{2}\+[0-9]+$ ]]
+}
+
+function exactDailyGTNHversionMarker(){
+  local java_release=""
+  local java_variant=""
+  java_release="$(mc-image-helper java-release)"
+  if (( java_release == 8 )); then
+    java_variant="server-java8"
+  else
+    java_variant="server-java17-25"
+  fi
+  printf 'GTNH-%s-%s.zip\n' "$GTNH_PACK_VERSION" "$java_variant"
+}
+
+function exactDailyGTNHisAlreadyInstalled(){
+  isExactDailyGTNHpackVersion || return 1
+  [[ -s /data/.gtnh-version ]] || return 1
+  [[ "$(exactDailyGTNHversionMarker)" == "$(cat /data/.gtnh-version)" ]]
+}
+
+function hasGTNHgithubToken(){
+  local xtrace_enabled="false"
+  [[ $- == *x* ]] && xtrace_enabled="true" && set +x
+  [[ -n "${GTNH_GITHUB_TOKEN:-}" ||
+     (-n "${GTNH_GITHUB_TOKEN_FILE:-}" && -s "${GTNH_GITHUB_TOKEN_FILE}") ]]
+  local status=$?
+  isTrue "$xtrace_enabled" && set -x
+  return "$status"
+}
+
+function githubApiCurl(){
+  local xtrace_enabled="false"
+  local github_token=""
+  local status=0
+  [[ $- == *x* ]] && xtrace_enabled="true" && set +x
+
+  if [[ -n "${GTNH_GITHUB_TOKEN:-}" ]]; then
+    github_token="$GTNH_GITHUB_TOKEN"
+  elif [[ -n "${GTNH_GITHUB_TOKEN_FILE:-}" && -s "${GTNH_GITHUB_TOKEN_FILE}" ]]; then
+    github_token="$(<"$GTNH_GITHUB_TOKEN_FILE")"
+  fi
+
+  if [[ -n "$github_token" ]]; then
+    curl -fsSL \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -H "Authorization: Bearer $github_token" \
+      "$@"
+    status=$?
+  else
+    curl -fsSL \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      "$@"
+    status=$?
+  fi
+
+  github_token=""
+  isTrue "$xtrace_enabled" && set -x
+  return "$status"
+}
+
+function selectDailyGTNHpack(){
+  local artifacts_url=""
+  local artifacts_json=""
+  local artifact=""
+  local artifact_name=""
+  local build_id=""
+  local java_variant=""
+  local run_json=""
+
+  isDailyGTNHpackVersion || return 1
+
+  if ! hasGTNHgithubToken; then
+    logError "GTNH_GITHUB_TOKEN (or GTNH_GITHUB_TOKEN_FILE) is required to download GitHub Actions daily artifacts."
+    logError "Use a read-only token with Actions access and store it as a secret in Coolify."
+    exit 1
+  fi
+
+  if (( current_java_version == 8 )); then
+    java_variant="server-java8"
+  elif (( current_java_version >= 17 && current_java_version <= 25 )); then
+    java_variant="server-java17-25"
+  else
+    logError "GTNH daily builds support Java 8 or Java 17-25; found Java $current_java_version."
+    exit 1
+  fi
+
+  if [[ "$GTNH_PACK_VERSION" == "daily" || "$GTNH_PACK_VERSION" == "latest-daily" ]]; then
+    log "Resolving the latest successful tested GTNH daily workflow run."
+    if ! run_json="$(githubApiCurl \
+        "$GTNH_GITHUB_API/repos/$GTNH_DAILY_REPOSITORY/actions/workflows/$GTNH_DAILY_WORKFLOW/runs?branch=master&status=success&per_page=10")"; then
+      logError "Unable to retrieve GTNH daily workflow runs from GitHub."
+      exit 1
+    fi
+    artifacts_url="$(jq -r '.workflow_runs | map(select(.conclusion == "success")) | first | .artifacts_url // empty' <<< "$run_json")"
+    if [[ -z "$artifacts_url" ]]; then
+      logError "No successful GTNH daily workflow run was found."
+      exit 1
+    fi
+  else
+    build_id="${GTNH_PACK_VERSION#daily-}"
+    artifact_name="GTNH-daily-${build_id}-${java_variant}.zip"
+    log "Resolving exact tested GTNH daily artifact $artifact_name."
+    local encoded_artifact_name="${artifact_name//+/%2B}"
+    artifacts_url="$GTNH_GITHUB_API/repos/$GTNH_DAILY_REPOSITORY/actions/artifacts?name=$encoded_artifact_name&per_page=100"
+  fi
+
+  if ! artifacts_json="$(githubApiCurl "$artifacts_url")"; then
+    logError "Unable to retrieve GTNH daily artifact metadata from GitHub."
+    exit 1
+  fi
+
+  if [[ -n "$artifact_name" ]]; then
+    artifact="$(jq -c --arg name "$artifact_name" \
+      '.artifacts | map(select(.name == $name and (.expired | not))) | sort_by(.created_at) | last // empty' \
+      <<< "$artifacts_json")"
+  else
+    artifact="$(jq -c --arg suffix "-$java_variant.zip" \
+      '.artifacts | map(select((.expired | not) and (.name | endswith($suffix)))) | sort_by(.created_at) | last // empty' \
+      <<< "$artifacts_json")"
+  fi
+
+  if [[ -z "$artifact" ]]; then
+    logError "The requested GTNH daily artifact was not found or has expired."
+    logError "Choose a successful build still listed on the DreamAssemblerXXL Actions page."
+    exit 1
+  fi
+
+  artifact_name="$(jq -r '.name' <<< "$artifact")"
+  build_id="${artifact_name#GTNH-daily-}"
+  build_id="${build_id%-"$java_variant".zip}"
+  setGTNHdownloadPath \
+    "$(jq -r '.archive_download_url' <<< "$artifact")" \
+    "$artifact_name" \
+    "github-actions" \
+    "$(jq -r '.digest // empty' <<< "$artifact" | sed 's/^sha256://')" \
+    "$(jq -r '.size_in_bytes // empty' <<< "$artifact")"
+  log "Selected tested GTNH daily build $build_id for Java $current_java_version."
+  return 0
 }
 
 function isExactGTNHpackVersion(){
@@ -86,19 +235,28 @@ function selectSynthesizedGTNHpackUrl(){
 }
 
 function getGTNHdownloadPath(){
+  local max_java_version=""
+  local metadata_json=""
+  local release_entry=""
+  local release_key=""
+  local server_url=""
+
   gtnh_download_path=""
-  current_version=""
-  current_release_type=""
+  gtnh_selected_id=""
+  gtnh_download_kind=""
+  gtnh_download_sha256=""
+  gtnh_download_size=""
   current_java_version=$(mc-image-helper java-release)
+
+  if selectDailyGTNHpack; then
+    return
+  fi
 
   if selectExplicitGTNHpackUrl; then
     return
   fi
 
-  if ! packs_data="$(
-    curl -fsSL "https://downloads.gtnewhorizons.com/versions.json" \
-      | jq -r '.versions[]?.server? | .[]? | select(type=="string" and test("Server"))'
-  )"; then
+  if ! metadata_json="$(curl -fsSL "https://downloads.gtnewhorizons.com/versions.json")"; then
     logWarning "Failed to retrieve data from https://downloads.gtnewhorizons.com/versions.json"
     if selectSynthesizedGTNHpackUrl; then
       return
@@ -106,63 +264,38 @@ function getGTNHdownloadPath(){
     logError "Download metadata is unavailable and no fallback archive URL could be selected."
     exit 1
   fi
-  mapfile -t packs <<< "$packs_data"
 
-  log "Start locating server files..."
-  for pack in "${packs[@]}"; do
-    pack_basename="$(basename "$pack")"
-    pack_java_version="$(printf '%s\n' "$pack_basename" | grep -Eo 'Java_[0-9]+(-[0-9]+)?' | sed 's/Java_//' || true)"
-    if [[ -z "$pack_java_version" ]]; then
-      logWarning "Could not parse java version of $pack"
-      continue
+  case "$GTNH_PACK_VERSION" in
+    latest)
+      release_entry="$(jq -c '(.versions // .) | to_entries | map(select(.value.title == "Stable release")) | sort_by(.value.releaseDate) | last // empty' <<< "$metadata_json")"
+      ;;
+    latest-dev)
+      release_entry="$(jq -c '(.versions // .) | to_entries | map(select(.value.title == "Beta release")) | sort_by(.value.releaseDate) | last // empty' <<< "$metadata_json")"
+      ;;
+    *)
+      release_entry="$(jq -c --arg version "$GTNH_PACK_VERSION" '(.versions // .) | to_entries | map(select(.key == $version)) | first // empty' <<< "$metadata_json")"
+      ;;
+  esac
+
+  if [[ -n "$release_entry" ]]; then
+    release_key="$(jq -r '.key' <<< "$release_entry")"
+    max_java_version="$(jq -r '.value.maxJavaVersion // empty' <<< "$release_entry")"
+    if (( current_java_version == 8 )); then
+      server_url="$(jq -r '.value.server.java8Url // empty' <<< "$release_entry")"
+    elif (( current_java_version >= 17 )); then
+      if [[ -n "$max_java_version" ]] && (( current_java_version > max_java_version )); then
+        logError "Container Java version $current_java_version is not supported by GTNH $release_key (maximum Java $max_java_version)."
+        exit 1
+      fi
+      server_url="$(jq -r '.value.server.java17_2XUrl // empty' <<< "$release_entry")"
     fi
 
-    if [[ "$pack_java_version" == *-* ]]; then
-      java_min_version=$(echo "$pack_java_version" | cut -d'-' -f1)
-      java_max_version=$(echo "$pack_java_version" | cut -d'-' -f2)
-      if (( current_java_version < java_min_version || current_java_version > java_max_version )); then
-        debug "Skipping $pack due to incompatible Java version: $current_java_version not in range $java_min_version-$java_max_version"
-        continue
-      fi
-    else
-      if (( current_java_version != pack_java_version )); then
-        debug "Skipping $pack due to incompatible Java version: $current_java_version != $pack_java_version"
-        continue
-      fi
+    if [[ -n "$server_url" ]]; then
+      log "Selected official GTNH server release $release_key from versions.json."
+      setGTNHdownloadPath "$server_url"
+      return
     fi
-
-    pack_version="$(packVersion "$pack")"
-    if [[ -z "$pack_version" ]]; then
-      logWarning "Could not parse version of $pack"
-      continue
-    fi
-
-    pack_release_type="$(packReleaseType "$pack")"
-    selected_version="$(packVersion "$gtnh_download_path")"
-    selected_release_type="$(packReleaseType "$gtnh_download_path")"
-
-    if [[ ($pack == *"/betas/"* && $GTNH_PACK_VERSION == "latest-dev") || ($pack != *"/betas/"* && $GTNH_PACK_VERSION == "latest") ]]; then
-      if [[ -z "$selected_version" || "$(printf '%s\n' "$pack_version" "$selected_version" | sort -V | tail -n 1)" == "$pack_version" ]]; then
-        if [[ "$pack_version" == "$selected_version" ]]; then
-          if [[ -z "$pack_release_type" ||
-              ("$pack_release_type" =~ ^[Rr][Cc] && "$selected_release_type" == beta*) ||
-              ("$pack_release_type" == "$selected_release_type" && "$(printf '%s\n' "$pack_release_type" "$selected_release_type" | sort -V | tail -n 1)" == "$pack_release_type") ]]; then
-            debug "$selected_version-$selected_release_type is older than $pack_version-$pack_release_type! Update latest version to: $pack_version-$pack_release_type"
-            setGTNHdownloadPath "$pack"
-          fi
-        else
-          debug "$selected_version is older than $pack_version! Update latest version to: $pack_version"
-          setGTNHdownloadPath "$pack"
-        fi
-      fi
-    else
-      if [[ "$pack_version" == "$GTNH_PACK_VERSION" || "$pack_version-$pack_release_type" == "$GTNH_PACK_VERSION" ]]; then
-        log "Found exact match for GTNH_PACK_VERSION=$GTNH_PACK_VERSION. Select $pack for download."
-        setGTNHdownloadPath "$pack"
-        break
-      fi
-    fi
-  done
+  fi
 
   if [[ -z "$gtnh_download_path" ]]; then
     selectSynthesizedGTNHpackUrl || true
@@ -170,79 +303,374 @@ function getGTNHdownloadPath(){
 }
 
 function deleteGTNHbackup(){
-  log "Start deleting all config backups"
-  if ! find . -maxdepth 1 -type d -name 'gtnh-upgrade-*' -exec rm -rf {} + ; then
+  log "Start deleting all GTNH transaction backups"
+  if ! find /data -maxdepth 1 -type d -name 'gtnh-upgrade-*' -exec rm -rf {} + ; then
     logWarning "Can not delete config backup!"
   fi
 }
 
-function updateGTNH(){
-  current_datetime=$(date +%Y-%m-%dT%H:%M)
+function gtnhManagedResources(){
+  printf '%s\n' \
+    libraries mods resources scripts config journeymap \
+    lwjgl3ify-forgePatches.jar java9args.txt \
+    startserver-java9.bat startserver-java9.sh \
+    forge-1.7.10-10.13.4.1614-1.7.10-universal.jar \
+    minecraft_server.1.7.10.jar startserver.bat startserver.sh
+}
 
-  folders_to_update=("libraries" "mods" "resources" "scripts")
-  files_to_update=("lwjgl3ify-forgePatches.jar" "java9args.txt" "startserver-java9.bat" "startserver-java9.sh" "forge-1.7.10-10.13.4.1614-1.7.10-universal.jar" "startserver.bat" "startserver.sh" "server-icon.png")
-  config_folder="config"
-  backup_folder="/data/gtnh-upgrade-${current_version}${current_release_type:+-$current_release_type}-$current_datetime"
-  journey_map_folder="JourneyMapServer"
+function safeGTNHbuildId(){
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._+-' '_'
+}
 
-  for folder in "${folders_to_update[@]}"; do
-    folder_path="/data/$folder"
-    if [[ -d "$folder_path" ]]; then
-      log "Deleting folder: $folder_path"
-      rm -rf "$folder_path"
-    fi
-  done
+function selectedGTNHversionMarker(){
+  printf '%s\n' "${gtnh_selected_id:-$(basename "$gtnh_download_path")}"
+}
 
-  for file in "${files_to_update[@]}"; do
-    file_path="/data/$file"
-    if [[ -f "$file_path" ]]; then
-      log "Deleting file: $file_path"
-      rm -f "$file_path"
-    fi
-  done
+function writeGTNHversionMarker(){
+  local marker_tmp="/data/.gtnh-version.tmp.$$"
+  selectedGTNHversionMarker > "$marker_tmp"
+  mv -f "$marker_tmp" /data/.gtnh-version
+}
 
-  if [[ -d "/data/$config_folder" ]]; then
-    log "Creating backup of /data/$config_folder at $backup_folder"
-    cp -r "/data/$config_folder" "$backup_folder"
-    log "Deleting original /data/$config_folder"
-    rm -rf "/data/$config_folder"
+function validateGTNHarchive(){
+  local candidate="$1"
+  local config_count=""
+  local library_count=""
+  local min_configs="${GTNH_MIN_CONFIG_FILES:-500}"
+  local min_libraries="${GTNH_MIN_LIBRARY_JARS:-20}"
+  local min_mods="${GTNH_MIN_MOD_JARS:-150}"
+  local mod_count=""
+  local required_file=""
+  local required_files=("forge-1.7.10-10.13.4.1614-1.7.10-universal.jar")
+
+  if [[ ! -d "$candidate/config" || ! -d "$candidate/mods" || ! -d "$candidate/libraries" ]]; then
+    logError "GTNH archive validation failed: config, mods, and libraries directories are required."
+    return 1
   fi
 
-  for folder in "${folders_to_update[@]}" "$config_folder"; do
-    if [[ -d "$base_dir/$folder" ]]; then
-      log "Copying $folder to /data"
-      cp -r "$base_dir/$folder" "/data/"
-    else
-      logWarning "Folder $folder not found in the unzipped data!"
+  if (( current_java_version >= 17 )); then
+    required_files+=("lwjgl3ify-forgePatches.jar" "java9args.txt" "startserver-java9.sh")
+  fi
+  for required_file in "${required_files[@]}"; do
+    if [[ ! -s "$candidate/$required_file" ]]; then
+      logError "GTNH archive validation failed: required runtime file is missing: $required_file"
+      return 1
     fi
   done
 
-  for file in "${files_to_update[@]}"; do
-    if [[ -f "$base_dir/$file" ]]; then
-      log "Copying $file to /data"
-      cp "$base_dir/$file" "/data/"
-    else
-      logWarning "File $file not found in the unzipped data!"
-    fi
-  done
-
-  if [[ ! -d "$config_folder" ]]; then
-    log "$config_folder does not exist. Creating it now."
-    mkdir -p "$config_folder"
+  mod_count="$(find "$candidate/mods" -maxdepth 1 -type f -name '*.jar' | wc -l)"
+  library_count="$(find "$candidate/libraries" -type f -name '*.jar' | wc -l)"
+  config_count="$(find "$candidate/config" -type f | wc -l)"
+  if (( mod_count < min_mods || library_count < min_libraries || config_count < min_configs )); then
+    logError "GTNH archive validation failed: found $mod_count mod jars, $library_count library jars, and $config_count config files."
+    logError "Expected at least $min_mods mod jars, $min_libraries library jars, and $min_configs config files."
+    return 1
   fi
 
-  if [[ -d "$backup_folder/$journey_map_folder" ]]; then
-    log "Restoring $journey_map_folder to $config_folder"
-    cp -r "$backup_folder/$journey_map_folder" "$config_folder/"
+  if find "$candidate" -type l -print -quit | grep -q .; then
+    logError "GTNH archive validation failed: symbolic links are not allowed in the server pack."
+    return 1
+  fi
+
+  log "Validated complete GTNH server archive ($mod_count mods, $library_count libraries, $config_count config files)."
+}
+
+function downloadGTNH(){
+  local actual_sha256=""
+  local actual_size=""
+  local gtnh_download=""
+  local packs_dir="/data/.tmp/packs"
+
+  original_base_dir="/data/.tmp/gtnh_base"
+  base_dir="$original_base_dir"
+  rm -rf "$original_base_dir" "$packs_dir"
+  mkdir -p "$original_base_dir" "$packs_dir"
+
+  if [[ "$gtnh_download_kind" == "github-actions" ]]; then
+    gtnh_download="$packs_dir/$gtnh_selected_id"
+    log "Downloading authenticated GTNH daily artifact $gtnh_selected_id."
+    if ! githubApiCurl -o "$gtnh_download" "$gtnh_download_path"; then
+      logError "Failed to download GTNH daily artifact. Check token permissions and artifact expiry."
+      return 1
+    fi
   else
-    logWarning "$journey_map_folder not found in backup!"
+    log "Downloading $gtnh_download_path."
+    if ! gtnh_download=$(mc-image-helper get -o "$packs_dir" --output-filename --skip-up-to-date "$gtnh_download_path"); then
+      logError "Failed to download $gtnh_download_path"
+      return 1
+    fi
   fi
 
-  gtnh_changelog_file=$(mc-image-helper find --max-depth=1 --type=file --name=changelog*.md "$base_dir")
-  if [[ -n "$gtnh_changelog_file" ]]; then
-    log "Copying changelog file to /data"
-    cp -f "$gtnh_changelog_file" /data/
+  if [[ -n "$gtnh_download_size" ]]; then
+    actual_size="$(stat -c '%s' "$gtnh_download")"
+    if [[ "$actual_size" != "$gtnh_download_size" ]]; then
+      logError "GTNH archive size verification failed: expected $gtnh_download_size bytes, got $actual_size."
+      return 1
+    fi
   fi
+
+  if [[ -n "$gtnh_download_sha256" ]]; then
+    actual_sha256="$(sha256sum "$gtnh_download" | awk '{print $1}')"
+    if [[ "${actual_sha256,,}" != "${gtnh_download_sha256,,}" ]]; then
+      logError "GTNH archive digest verification failed."
+      return 1
+    fi
+    log "Verified GTNH archive SHA-256 digest."
+  fi
+
+  log "Unpacking GTNH server files into staging."
+  if ! extract "$gtnh_download" "$original_base_dir"; then
+    logError "Failed to extract GTNH server files."
+    return 1
+  fi
+  rm -f "$gtnh_download"
+  rm -f "$original_base_dir/eula.txt"
+
+  if ! base_dir=$(mc-image-helper find \
+      --max-depth=3 --type=directory --name=mods,config \
+      --only-shallowest --fail-no-matches --format '%h' \
+      "$original_base_dir"); then
+    logError "Unable to find content base of downloaded GTNH server files."
+    return 1
+  fi
+
+  validateGTNHarchive "$base_dir"
+}
+
+function rollbackGTNHupdate(){
+  local backup_folder="$1"
+  local failed="false"
+  local old_state="$backup_folder/.old-resources"
+  local resource=""
+  local state=""
+
+  if [[ ! -d "$backup_folder" || ! -f "$old_state" ]]; then
+    logError "Cannot roll back interrupted GTNH update; transaction backup is missing: $backup_folder"
+    return 1
+  fi
+
+  logWarning "Rolling back the incomplete GTNH pack update from $backup_folder."
+  while IFS='|' read -r state resource; do
+    [[ -n "$resource" ]] || continue
+    if [[ "$state" == "absent" ]]; then
+      if ! rm -rf "/data/$resource"; then
+        failed="true"
+      fi
+    elif [[ -e "$backup_folder/$resource" ]]; then
+      if ! rm -rf "/data/$resource" || ! mv "$backup_folder/$resource" "/data/$resource"; then
+        failed="true"
+      fi
+    elif [[ "$state" != "present" ]]; then
+      failed="true"
+    fi
+  done < "$old_state"
+
+  if isTrue "$failed"; then
+    logError "GTNH pack rollback did not complete; leaving $GTNH_UPDATE_MARKER in place for the next startup."
+    return 1
+  fi
+  if ! rm -f "$GTNH_UPDATE_MARKER"; then
+    logError "Rollback restored the GTNH pack, but the transaction marker could not be removed."
+    return 1
+  fi
+  log "GTNH pack rollback completed; persistent game data was not changed."
+}
+
+function recoverInterruptedGTNHupdate(){
+  local backup_folder=""
+  [[ -f "$GTNH_UPDATE_MARKER" ]] || return 0
+
+  backup_folder="$(head -n 1 "$GTNH_UPDATE_MARKER" | tr -d '\r\n')"
+  case "$backup_folder" in
+    /data/gtnh-upgrade-*) ;;
+    *)
+      logError "Invalid GTNH update transaction marker: $backup_folder"
+      return 1
+      ;;
+  esac
+  rollbackGTNHupdate "$backup_folder"
+}
+
+function createGTNHpreUpdateBackup(){
+  local backup_dir="/backups"
+  local backup_name=""
+  local backup_path=""
+  local current_datetime=""
+  local current_id="unknown"
+  local safe_current_id=""
+  local safe_target_id=""
+  local target_id=""
+  local temp_path=""
+
+  if isFalse "${GTNH_PRE_UPDATE_BACKUP:-true}"; then
+    logWarning "GTNH_PRE_UPDATE_BACKUP is disabled; continuing without an exact pre-upgrade data archive."
+    return 0
+  fi
+  if [[ ! -d "$backup_dir" || ! -w "$backup_dir" ]]; then
+    logError "$backup_dir must be mounted read-write to create the required pre-upgrade backup."
+    return 1
+  fi
+
+  current_datetime="$(date +%Y-%m-%dT%H%M%S)"
+  [[ -s /data/.gtnh-version ]] && current_id="$(head -n 1 /data/.gtnh-version)"
+  target_id="$(selectedGTNHversionMarker)"
+  safe_current_id="$(safeGTNHbuildId "$current_id")"
+  safe_target_id="$(safeGTNHbuildId "$target_id")"
+  backup_name="gtnh-pre-upgrade-${safe_current_id}-to-${safe_target_id}-${current_datetime}.tar.gz"
+  backup_path="$backup_dir/$backup_name"
+  temp_path="$backup_dir/.${backup_name}.tmp.$$"
+
+  log "Creating offline pre-upgrade data backup at $backup_path."
+  if ! (
+    set -o pipefail
+    cd /data
+    tar \
+      --exclude='./.tmp' \
+      --exclude='./backups' \
+      --exclude='./cache' \
+      --exclude='./logs' \
+      --exclude='./packs' \
+      --exclude='./gtnh-upgrade-*' \
+      --exclude='./libraries' \
+      --exclude='./mods' \
+      --exclude='./journeymap' \
+      --exclude='./*.jar' \
+      -cf - . | gzip -1 > "$temp_path"
+  ); then
+    rm -f "$temp_path"
+    logError "Failed to create the pre-upgrade GTNH data backup."
+    return 1
+  fi
+
+  if ! gzip -t "$temp_path" || ! tar -tzf "$temp_path" >/dev/null; then
+    rm -f "$temp_path"
+    logError "Pre-upgrade GTNH data backup verification failed."
+    return 1
+  fi
+  if ! mv "$temp_path" "$backup_path"; then
+    rm -f "$temp_path"
+    logError "Unable to commit the verified pre-upgrade GTNH data backup."
+    return 1
+  fi
+  if ! date -u +%s > "$backup_dir/.last-verified.tmp.$$" ||
+     ! mv "$backup_dir/.last-verified.tmp.$$" "$backup_dir/.last-verified"; then
+    logWarning "Backup is valid, but the .last-verified health marker could not be updated."
+  fi
+  log "Verified offline pre-upgrade data backup: $backup_path"
+}
+
+function updateGTNH(){
+  local backup_folder=""
+  local changelog_file=""
+  local current_datetime=""
+  local current_id="unknown"
+  local marker_tmp="${GTNH_UPDATE_MARKER}.tmp.$$"
+  local old_state=""
+  local resource=""
+  local safe_current_id=""
+  local safe_target_id=""
+  local target_id=""
+  local -a managed_resources=()
+
+  if ! createGTNHpreUpdateBackup; then
+    logError "Refusing to update GTNH without a verified pre-upgrade data backup."
+    return 1
+  fi
+
+  mapfile -t managed_resources < <(gtnhManagedResources)
+  current_datetime="$(date +%Y-%m-%dT%H%M%S)"
+  [[ -s /data/.gtnh-version ]] && current_id="$(head -n 1 /data/.gtnh-version)"
+  target_id="$(selectedGTNHversionMarker)"
+  safe_current_id="$(safeGTNHbuildId "$current_id")"
+  safe_target_id="$(safeGTNHbuildId "$target_id")"
+  backup_folder="/data/gtnh-upgrade-${safe_current_id}-to-${safe_target_id}-${current_datetime}-$$"
+  old_state="$backup_folder/.old-resources"
+
+  if ! mkdir -p "$backup_folder"; then
+    logError "Unable to create GTNH transaction backup: $backup_folder"
+    return 1
+  fi
+
+  if ! : > "$old_state"; then
+    logError "Unable to initialize GTNH transaction state: $old_state"
+    return 1
+  fi
+  for resource in "${managed_resources[@]}"; do
+    if [[ -e "/data/$resource" ]]; then
+      if ! printf 'present|%s\n' "$resource" >> "$old_state"; then
+        logError "Unable to record GTNH transaction state."
+        return 1
+      fi
+    else
+      if ! printf 'absent|%s\n' "$resource" >> "$old_state"; then
+        logError "Unable to record GTNH transaction state."
+        return 1
+      fi
+    fi
+  done
+  if ! printf '%s\n' "$backup_folder" > "$marker_tmp" || ! mv -f "$marker_tmp" "$GTNH_UPDATE_MARKER"; then
+    logError "Unable to create the GTNH update transaction marker."
+    rm -f "$marker_tmp"
+    return 1
+  fi
+
+  log "Starting transactional GTNH pack update; rollback data is in $backup_folder."
+  for resource in "${managed_resources[@]}"; do
+    if [[ -e "/data/$resource" ]]; then
+      if ! mv "/data/$resource" "$backup_folder/$resource"; then
+        logError "Failed to stage existing GTNH resource for rollback: $resource"
+        rollbackGTNHupdate "$backup_folder"
+        return 1
+      fi
+    fi
+  done
+
+  for resource in "${managed_resources[@]}"; do
+    if [[ -e "$base_dir/$resource" ]]; then
+      if ! mv "$base_dir/$resource" "/data/$resource"; then
+        logError "Failed to install staged GTNH resource: $resource"
+        rollbackGTNHupdate "$backup_folder"
+        return 1
+      fi
+    fi
+  done
+
+  if [[ -d "$backup_folder/config/JourneyMapServer" ]]; then
+    log "Restoring persistent JourneyMapServer data."
+    rm -rf /data/config/JourneyMapServer
+    if ! cp -a "$backup_folder/config/JourneyMapServer" /data/config/; then
+      logError "Failed to restore JourneyMapServer data."
+      rollbackGTNHupdate "$backup_folder"
+      return 1
+    fi
+  fi
+
+  changelog_file="$(mc-image-helper find --max-depth=1 --type=file --name=changelog*.md "$base_dir" || true)"
+  if [[ -n "$changelog_file" ]] && ! cp -f "$changelog_file" /data/; then
+    logError "Failed to copy the GTNH changelog."
+    rollbackGTNHupdate "$backup_folder"
+    return 1
+  fi
+
+  if ! rm -f "$GTNH_UPDATE_MARKER"; then
+    logError "Unable to commit the GTNH update transaction."
+    rollbackGTNHupdate "$backup_folder"
+    return 1
+  fi
+  log "Transactional GTNH pack update completed. Rollback snapshot retained at $backup_folder."
+}
+
+function hasExistingGTNHinstall(){
+  [[ -d /data/mods || -d /data/config || -f /data/lwjgl3ify-forgePatches.jar || -f /data/forge-1.7.10-10.13.4.1614-1.7.10-universal.jar ]]
+}
+
+function installGTNH(){
+  log "Installing validated GTNH server files without overwriting unrelated persistent data."
+  cp -a -n "$base_dir/." /data/
+}
+
+function cleanupGTNHtemporaryFiles(){
+  rm -rf /data/.tmp
 }
 
 function handleGTNH() {
@@ -250,13 +678,24 @@ function handleGTNH() {
   : "${GTNH_DELETE_BACKUPS:=false}"
   : "${SKIP_GTNH_UPDATE_CHECK:=false}"
   : "${GTNH_PACK_URL:=}"
+  : "${GTNH_PACK_SHA256:=}"
   debug "GTNH VAR CHECK: GTNH_DELETE_BACKUPS=$GTNH_DELETE_BACKUPS, GTNH_PACK_VERSION=$GTNH_PACK_VERSION, GTNH_PACK_URL=$GTNH_PACK_URL, TYPE=$TYPE, SKIP_GTNH_UPDATE_CHECK=$SKIP_GTNH_UPDATE_CHECK"
+
+  if ! recoverInterruptedGTNHupdate; then
+    logError "Manual recovery is required before GTNH can start."
+    exit 1
+  fi
 
   if isTrue "$GTNH_DELETE_BACKUPS"; then
     deleteGTNHbackup
   fi
 
   if [[ -n $GTNH_PACK_VERSION ]] && isFalse "$SKIP_GTNH_UPDATE_CHECK" ; then
+    if exactDailyGTNHisAlreadyInstalled; then
+      log "No update required: the exact pinned daily build is already installed."
+      return 0
+    fi
+
     getGTNHdownloadPath
 
     if [[ -z $gtnh_download_path ]]; then
@@ -266,49 +705,39 @@ function handleGTNH() {
       fi
       exit 1
     fi
-    log "Server files located! Will proceed update $gtnh_download_path."
+    local selected_marker=""
+    selected_marker="$(selectedGTNHversionMarker)"
+    log "Server files located: $selected_marker"
 
-    if [[ ! -f /data/.gtnh-version || "$(basename "$gtnh_download_path")" != "$(cat /data/.gtnh-version)" ]]; then
-      log "Update/Install required: /data/.gtnh-version is missing or does not match the selected version $(basename "$gtnh_download_path")."
+    if [[ ! -f /data/.gtnh-version || "$selected_marker" != "$(cat /data/.gtnh-version)" ]]; then
+      log "Update/install required: selected build is $selected_marker."
 
-      mkdir -p /data/packs
-      log "Downloading $gtnh_download_path."
-      if ! gtnh_download=$(mc-image-helper get -o /data/packs --output-filename --skip-up-to-date "$gtnh_download_path"); then
-        logError "Failed to download $gtnh_download_path"
+      if ! downloadGTNH; then
+        logError "GTNH download or preflight validation failed; /data was not changed."
         exit 1
       fi
 
-      log "Unpacking Server Files..."
-      original_base_dir=/data/.tmp/gtnh_base
-      base_dir=$original_base_dir
-      rm -rf "${base_dir}"
-      mkdir -p "${base_dir}"
-      extract "${gtnh_download}" "${base_dir}"
-      trap 'rm -rf /data/.tmp' EXIT
-      rm -f "$gtnh_download"
-
-      rm -f "${base_dir}/eula.txt"
-
-      if ! base_dir=$(mc-image-helper find \
-          --max-depth=3 --type=directory --name=mods,config \
-          --only-shallowest --fail-no-matches --format '%h' \
-          "$base_dir"); then
-        logError "Unable to find content base of downloaded Server Files"
-        exit 1
-      fi
-
-      if [[ -f /data/.gtnh-version ]]; then
-        log ".gtnh-version file detected! Assuming old version already exists. Proceed updating existing server..."
-        updateGTNH
+      if hasExistingGTNHinstall; then
+        log "Existing GTNH installation detected; applying transactional update."
+        if ! updateGTNH; then
+          logError "GTNH update failed and was rolled back."
+          exit 1
+        fi
       else
-        log "No .gtnh-version file detected! Assuming no old server exists. Proceed installing new server..."
-        cp -R -f "${base_dir}"/* /data
+        log "No existing GTNH installation detected; installing new server."
+        if ! installGTNH; then
+          logError "GTNH installation failed."
+          exit 1
+        fi
       fi
-      basename "$gtnh_download_path" > /data/.gtnh-version
+      if ! writeGTNHversionMarker; then
+        logError "GTNH files were installed, but the version marker could not be written."
+        exit 1
+      fi
       rm -rf "$original_base_dir"
 
     else
-      log "No update required: /data/.gtnh-version matches the selected version $(basename "$gtnh_download_path")."
+      log "No update required: /data/.gtnh-version matches $selected_marker."
     fi
   else
     log "SKIP_GTNH_UPDATE_CHECK=$SKIP_GTNH_UPDATE_CHECK ... Skipping GTNH Update/Install"
@@ -355,34 +784,43 @@ function applyGTNHSafetyOverrides() {
   setGTNHconfigValue "$serverutilities" "B:backup_entire_regions_with_claims" "${GTNH_INTERNAL_BACKUP_WHOLE_REGIONS:-true}"
 }
 
-log "Applying GTNH optimized server defaults"
-export ALLOW_FLIGHT="${ALLOW_FLIGHT:=true}"
-export LEVEL_TYPE="${LEVEL_TYPE:=rwg}"
-export DIFFICULTY="${DIFFICULTY:=3}"
-export ENABLE_COMMAND_BLOCK="${ENABLE_COMMAND_BLOCK:=true}"
-export MOTD="${MOTD:="Greg Tech New Horizons $GTNH_PACK_VERSION"}"
-debug "Set MOTD=$MOTD, ENABLE_COMMAND_BLOCK=$ENABLE_COMMAND_BLOCK, DIFFICULTY=$DIFFICULTY, LEVEL_TYPE=$LEVEL_TYPE, ALLOW_FLIGHT=$ALLOW_FLIGHT"
+function main(){
+  trap cleanupGTNHtemporaryFiles EXIT
 
-isDebugging && set -x
+  log "Applying GTNH optimized server defaults"
+  export ALLOW_FLIGHT="${ALLOW_FLIGHT:=true}"
+  export LEVEL_TYPE="${LEVEL_TYPE:=rwg}"
+  export DIFFICULTY="${DIFFICULTY:=3}"
+  export ENABLE_COMMAND_BLOCK="${ENABLE_COMMAND_BLOCK:=true}"
+  export MOTD="${MOTD:="Greg Tech New Horizons $GTNH_PACK_VERSION"}"
+  debug "Set MOTD=$MOTD, ENABLE_COMMAND_BLOCK=$ENABLE_COMMAND_BLOCK, DIFFICULTY=$DIFFICULTY, LEVEL_TYPE=$LEVEL_TYPE, ALLOW_FLIGHT=$ALLOW_FLIGHT"
 
-ensureRemoveAllModsOff "MODPACK_PLATFORM=GTNH"
+  isDebugging && set -x
 
-java_version=$(mc-image-helper java-release)
-if (( java_version == 8 )); then
-  export SERVER=/data/forge-1.7.10-10.13.4.1614-1.7.10-universal.jar
-elif (( java_version >= 17 )); then
-  export SERVER=/data/lwjgl3ify-forgePatches.jar
-else
-  logError "Greg Tech New Horizons only supports the following Java versions: 8, 17 or later"
-  exit 1
+  ensureRemoveAllModsOff "MODPACK_PLATFORM=GTNH"
+
+  java_version=$(mc-image-helper java-release)
+  if (( java_version == 8 )); then
+    export SERVER=/data/forge-1.7.10-10.13.4.1614-1.7.10-universal.jar
+  elif (( java_version >= 17 )); then
+    export SERVER=/data/lwjgl3ify-forgePatches.jar
+  else
+    logError "Greg Tech New Horizons only supports the following Java versions: 8, 17 or later"
+    exit 1
+  fi
+
+  log "TYPE=GTNH, setting Minecraft version to 1.7.10"
+  export VERSION=1.7.10
+
+  handleGTNH
+  applyGTNHSafetyOverrides
+
+  export USES_MODS=true
+  cleanupGTNHtemporaryFiles
+  trap - EXIT
+  exec "$(dirname "$0")/start-setupWorld" "$@"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
 fi
-
-log "TYPE=GTNH, setting Minecraft version to 1.7.10"
-export VERSION=1.7.10
-
-handleGTNH
-applyGTNHSafetyOverrides
-
-export USES_MODS=true
-
-exec "$(dirname "$0")/start-setupWorld" "$@"

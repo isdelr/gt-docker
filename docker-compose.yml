@@ -39,6 +39,9 @@ services:
       GTNH_INTERNAL_BACKUP_WHOLE_REGIONS: ${GTNH_INTERNAL_BACKUP_WHOLE_REGIONS:-true}
       GTNH_PACK_VERSION: ${GTNH_PACK_VERSION:-2.9.0-beta-2}
       GTNH_PACK_URL: ${GTNH_PACK_URL:-}
+      GTNH_PACK_SHA256: ${GTNH_PACK_SHA256:-}
+      GTNH_GITHUB_TOKEN: ${GTNH_GITHUB_TOKEN:-}
+      GTNH_PRE_UPDATE_BACKUP: ${GTNH_PRE_UPDATE_BACKUP:-true}
       SKIP_GTNH_UPDATE_CHECK: ${SKIP_GTNH_UPDATE_CHECK:-false}
       GTNH_DELETE_BACKUPS: ${GTNH_DELETE_BACKUPS:-false}
       SERVER_PORT: ${SERVER_PORT:-25565}
@@ -64,7 +67,7 @@ services:
       - "${QUERY_PORT:-25565}:${QUERY_PORT:-25565}/udp"
     volumes:
       - gtnh-data:/data
-      - gtnh-backups:/backups:ro
+      - gtnh-backups:/backups
     labels:
       me.isalab.gtnh.role: server
     healthcheck:

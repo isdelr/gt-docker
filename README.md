@@ -17,6 +17,7 @@ By default it is configured to:
 - limit automatic Minecraft restart attempts to three
 - keep the whitelist enabled from first boot
 - bridge GTNH download metadata gaps for pinned releases
+- install tested DreamAssemblerXXL daily server artifacts with digest checks and transactional rollback
 
 ## Official GTNH links
 
@@ -32,7 +33,7 @@ By default it is configured to:
 - `Dockerfile`: tiny wrapper around `itzg/minecraft-server` for startup recovery and the GTNH resolver override
 - `docker/gtnh-entrypoint.sh`: enforces corruption quarantine and retains opt-in level.dat recovery
 - `docker/gtnh-corruption-guard.sh`: records evidence and stops Minecraft on corruption
-- `docker/start-deployGTNH`: resolves releases and reapplies operational safety settings after upgrades
+- `docker/start-deployGTNH`: resolves releases/dailies, validates server archives, updates transactionally, and reapplies operational safety settings
 - `ops/gtnh-graceful-shutdown*`: host shutdown hook and Docker stop helper
 - `.env.example`: envs you can copy into Coolify or a local `.env`
 
@@ -49,11 +50,13 @@ Coolify treats `docker-compose.yml` as the source of truth, and it auto-detects 
 - Production is pinned to `GTNH_PACK_VERSION=2.9.0-beta-2`; clients must use the matching pack.
 - For predictable updates, pin `GTNH_PACK_VERSION` to a specific version. Exact pinned versions are first resolved through GTNH's official metadata; if missing, the image tries the standard official server archive URL.
 - `GTNH_PACK_URL` is optional. Set it only when a pinned version exists but the archive filename or location does not follow the standard GTNH pattern.
+- Tested daily builds use identifiers such as `daily-2026-07-19+630`. They come from DreamAssemblerXXL Actions, not the config-only nightly release ZIP.
+- Daily artifact downloads require `GTNH_GITHUB_TOKEN`, stored as a Coolify secret with read-only GitHub Actions access.
 - `ENABLE_WHITELIST=true` and `ENFORCE_WHITELIST=true` means nobody can join until you add them.
 - The Minecraft TCP port is mapped with `MC_PORT`, while the in-game server binds to `SERVER_PORT`.
 - Query is off by default. If you enable it, the compose file already maps the configured UDP query port.
 
-## GTNH version pinning
+## GTNH release pinning
 
 For normal stable tracking, leave:
 
@@ -81,6 +84,36 @@ If a release uses a non-standard archive name or location, set the direct server
 GTNH_PACK_VERSION=2.9.0-beta-2
 GTNH_PACK_URL=https://downloads.gtnewhorizons.com/ServerPacks/betas/GT_New_Horizons_2.9.0-beta-2_Server_Java_17-25.zip
 ```
+
+For a custom direct URL, `GTNH_PACK_SHA256` can pin its expected SHA-256 digest. Daily artifacts obtain and verify their digest from GitHub automatically.
+
+## Tested daily builds
+
+Do not use the ZIP attached to a `GT-New-Horizons-Modpack` nightly release as a server archive. GTNH's release workflow describes that ZIP as the modpack config/script bundle, and it does not contain the server libraries, runtime launcher, or assembled mod JAR set.
+
+Use the matching successful `DreamAssemblerXXL` daily workflow instead. For the config release `2.9.0-nightly-2026-07-19`, the official daily manifest identifies build `daily-2026-07-19+630`; workflow run 630 produced and tested these matching artifacts:
+
+- `GTNH-daily-2026-07-19+630-server-java17-25.zip` for this server
+- `GTNH-daily-2026-07-19+630-mmcprism-java17-25.zip` for Java 17-25 clients
+
+Set these Coolify variables and redeploy:
+
+```text
+GTNH_PACK_VERSION=daily-2026-07-19+630
+GTNH_PACK_URL=
+GTNH_GITHUB_TOKEN=<Coolify secret with read-only Actions access>
+```
+
+`latest-daily` is also supported, but an exact daily ID is safer for production because server and clients remain pinned together. GitHub Actions artifacts expire after 90 days. An installed exact daily continues to start after expiry, but reinstalling that build onto an empty volume requires the artifact to still exist.
+
+The daily updater fails before changing `/data` unless the artifact:
+
+- exists and is not expired
+- matches GitHub's byte size and SHA-256 digest
+- contains the complete server runtime, including `config`, `mods`, `libraries`, Forge, and the Java 17+ launcher
+- contains a plausible assembled server set rather than the config-only nightly's seven mod metadata entries and zero mod JARs
+
+Updates replace only pack-managed runtime paths. Worlds, player data, `server.properties`, whitelist/ops/ban files, `serverutilities`, custom server icon, backups, and other unrelated `/data` content are not touched. Existing `config/JourneyMapServer` data is restored into the new config. Before files move, the stopped server creates and verifies `gtnh-pre-upgrade-*.tar.gz` on the separate `/backups` volume; this captures the exact world/player/admin state before any newer mod can migrate it. The previous managed runtime and full prior config remain under `/data/gtnh-upgrade-*`; an interrupted transaction is rolled back on the next startup before Minecraft launches.
 
 ## Graceful shutdown
 
@@ -164,6 +197,8 @@ You can validate the compose file locally with:
 
 ```powershell
 docker compose --env-file .env.example config
+docker compose --env-file .env.example build gtnh
+docker run --rm --entrypoint bash --tmpfs /data --tmpfs /backups --mount "type=bind,src=$((Resolve-Path tests).Path),dst=/tests,readonly" gtnh-minecraft-server:2026.5.3-java25 /tests/test-gtnh-deploy.sh
 ```
 
 ## Sources
@@ -172,6 +207,9 @@ docker compose --env-file .env.example config
 - GTNH downloads: [https://www.gtnewhorizons.com/downloads/](https://www.gtnewhorizons.com/downloads/)
 - GTNH stable mirror: [https://downloads.gtnewhorizons.com/Latest/Stable/](https://downloads.gtnewhorizons.com/Latest/Stable/)
 - GTNH versions metadata: [https://downloads.gtnewhorizons.com/versions.json](https://downloads.gtnewhorizons.com/versions.json)
+- GTNH nightly config release example: [https://github.com/GTNewHorizons/GT-New-Horizons-Modpack/releases/tag/2.9.0-nightly-2026-07-19](https://github.com/GTNewHorizons/GT-New-Horizons-Modpack/releases/tag/2.9.0-nightly-2026-07-19)
+- DreamAssemblerXXL tested daily run 630: [https://github.com/GTNewHorizons/DreamAssemblerXXL/actions/runs/29675980744](https://github.com/GTNewHorizons/DreamAssemblerXXL/actions/runs/29675980744)
+- GitHub Actions artifact API: [https://docs.github.com/en/rest/actions/artifacts](https://docs.github.com/en/rest/actions/artifacts)
 - GTNH in the Docker image docs: [https://docker-minecraft-server.readthedocs.io/en/latest/types-and-platforms/mod-platforms/gtnh/](https://docker-minecraft-server.readthedocs.io/en/latest/types-and-platforms/mod-platforms/gtnh/)
 - Server properties and whitelist docs: [https://docker-minecraft-server.readthedocs.io/en/latest/configuration/server-properties/](https://docker-minecraft-server.readthedocs.io/en/latest/configuration/server-properties/)
 - JVM/memory docs: [https://docker-minecraft-server.readthedocs.io/en/latest/configuration/jvm-options/](https://docker-minecraft-server.readthedocs.io/en/latest/configuration/jvm-options/)
