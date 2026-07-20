@@ -491,6 +491,16 @@ function recoverInterruptedGTNHupdate(){
   rollbackGTNHupdate "$backup_folder"
 }
 
+function validateGTNHpreUpdateBackupDestination(){
+  if isFalse "${GTNH_PRE_UPDATE_BACKUP:-true}"; then
+    return 0
+  fi
+  if [[ ! -d /backups || ! -w /backups ]]; then
+    logError "/backups must be mounted read-write and writable by the Minecraft UID to create the required pre-upgrade backup."
+    return 1
+  fi
+}
+
 function createGTNHpreUpdateBackup(){
   local backup_dir="/backups"
   local backup_name=""
@@ -506,8 +516,7 @@ function createGTNHpreUpdateBackup(){
     logWarning "GTNH_PRE_UPDATE_BACKUP is disabled; continuing without an exact pre-upgrade data archive."
     return 0
   fi
-  if [[ ! -d "$backup_dir" || ! -w "$backup_dir" ]]; then
-    logError "$backup_dir must be mounted read-write to create the required pre-upgrade backup."
+  if ! validateGTNHpreUpdateBackupDestination; then
     return 1
   fi
 
@@ -711,6 +720,11 @@ function handleGTNH() {
 
     if [[ ! -f /data/.gtnh-version || "$selected_marker" != "$(cat /data/.gtnh-version)" ]]; then
       log "Update/install required: selected build is $selected_marker."
+
+      if hasExistingGTNHinstall && ! validateGTNHpreUpdateBackupDestination; then
+        logError "Refusing to download or update GTNH until the backup destination is writable."
+        exit 1
+      fi
 
       if ! downloadGTNH; then
         logError "GTNH download or preflight validation failed; /data was not changed."

@@ -22,6 +22,31 @@ is_true() {
   esac
 }
 
+prepare_backup_volume() {
+  is_true "${GTNH_PRE_UPDATE_BACKUP:-true}" || return 0
+
+  backup_dir="/backups"
+  target_uid="${UID:-1000}"
+  target_gid="${GID:-1000}"
+
+  if [ "$(id -u)" = "0" ]; then
+    mkdir -p "$backup_dir"
+    if [ "$(stat -c '%u:%g' "$backup_dir")" != "${target_uid}:${target_gid}" ]; then
+      log "Changing ownership of $backup_dir to ${target_uid}:${target_gid} for pre-upgrade backups."
+      chown "${target_uid}:${target_gid}" "$backup_dir"
+    fi
+    chmod u+rwx "$backup_dir"
+
+    if command -v gosu >/dev/null 2>&1 && ! gosu "${target_uid}:${target_gid}" test -w "$backup_dir"; then
+      log "Backup directory is not writable by ${target_uid}:${target_gid}: $backup_dir"
+      exit 1
+    fi
+  elif [ ! -w "$backup_dir" ]; then
+    log "Backup directory is not writable: $backup_dir"
+    exit 1
+  fi
+}
+
 mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
 }
@@ -325,6 +350,7 @@ start_corruption_guard() {
   log "Started the runtime chunk-corruption guard."
 }
 
+prepare_backup_volume
 enforce_corruption_quarantine
 maybe_restore_corrupt_level_dat
 maybe_restore_after_log_warning
