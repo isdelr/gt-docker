@@ -621,8 +621,8 @@ function createGTNHpreUpdateBackup(){
     return 1
   fi
 
-  log "Backup stream validated; flushing the archive to storage."
-  if ! sync -f "$temp_path"; then
+  log "Backup stream validated; flushing the archive file to storage."
+  if ! sync "$temp_path"; then
     rm -f "$temp_path"
     gtnh_pre_update_backup_temp=""
     logError "Pre-upgrade GTNH data backup could not be flushed to storage."
