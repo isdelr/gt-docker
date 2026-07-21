@@ -7,6 +7,7 @@ if [[ ! -f /.dockerenv ]]; then
 fi
 
 source /image/scripts/start-deployGTNH
+GTNH_BACKUP_MIN_FREE_GB=1
 
 function assertFileContains(){
   local file="$1"

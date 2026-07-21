@@ -135,7 +135,18 @@ The `gtnh-backups` service waits for Minecraft health, loads the image-generated
 
 Pre-upgrade and scheduled snapshots share `/backups/restic`. Successful snapshots are reopened by ID before `/backups/.last-verified` is updated, and the backup container becomes unhealthy when that marker is older than 13 hours. New snapshots are refused when less than 20 GiB remains free. Retention cannot guarantee a fixed repository size because world churn varies, so keep the health check and `gtnhctl doctor` monitored.
 
-Set `GTNH_RESTIC_PASSWORD` to a long Coolify secret before the first deployment. If it is blank, the entrypoint generates `/backups/.gtnh-restic-password`; preserve that file separately because snapshots cannot be opened without it. Changing the configured password later does not rotate the repository key and is intentionally rejected.
+Set only `GTNH_RESTIC_PASSWORD` to a long Coolify secret before the first deployment. The repository is deliberately fixed at `/backups/restic` in both containers and unsafe overrides are rejected without logging their value. If the password is blank, the entrypoint generates `/backups/.gtnh-restic-password`; preserve that file separately because snapshots cannot be opened without it. Changing the configured password later does not rotate an initialized repository key and is intentionally rejected.
+
+If an older deployment accidentally used the password as `GTNH_RESTIC_REPOSITORY`, treat that password as compromised. Rotate `GTNH_RESTIC_PASSWORD`, remove the obsolete repository variable from Coolify, and redeploy. Startup recognizes the misplaced repository under `/data`, excludes it from both backup paths, and permits the new password file because `/backups/restic` is still uninitialized. After the scheduled startup snapshot succeeds, run:
+
+```bash
+gtnhctl doctor
+gtnhctl snapshots
+gtnhctl cleanup-misplaced-restic --confirm
+gtnhctl doctor
+```
+
+Cleanup remains blocked until `/backups/.last-restic-snapshot` identifies a snapshot that can be reopened from the fixed repository and was verified within the last 13 hours. It never prints the misplaced directory name and redacts that name from the manager event logs as it removes the repository. Existing external container logs must be removed through the logging platform separately if they captured the old value.
 
 ServerUtilities supplies the faster tier every 30 minutes using complete region files containing claimed chunks. It retains up to 24 archives within a 20 GB cap. Restic snapshots and the VPS Backblaze snapshots protect unclaimed areas.
 
@@ -217,6 +228,7 @@ docker compose --env-file .env.example config
 docker compose --env-file .env.example build gtnh
 docker run --rm --entrypoint bash --tmpfs /data --tmpfs /backups --mount "type=bind,src=$((Resolve-Path tests).Path),dst=/tests,readonly" gtnh-minecraft-server:2026.5.3-java25 /tests/test-gtnh-deploy.sh
 docker run --rm --entrypoint bash --tmpfs /data --tmpfs /backups --mount "type=bind,src=$((Resolve-Path tests).Path),dst=/tests,readonly" gtnh-minecraft-server:2026.5.3-java25 /tests/test-gtnhctl.sh
+docker run --rm --entrypoint bash --tmpfs /data --tmpfs /backups --mount "type=bind,src=$((Resolve-Path tests).Path),dst=/tests,readonly" gtnh-minecraft-server:2026.5.3-java25 /tests/test-gtnh-entrypoint.sh
 ```
 
 ## Sources

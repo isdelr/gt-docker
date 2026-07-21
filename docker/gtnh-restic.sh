@@ -12,6 +12,33 @@ GTNH_MANAGER_DIR="${GTNH_MANAGER_DIR:-/data/.gtnh-manager}"
 GTNH_RESTIC_SNAPSHOT_ID=""
 GTNH_RESTIC_LAST_PROGRESS_EPOCH=0
 
+function validateGTNHresticRepository(){
+  if [[ "$GTNH_RESTIC_REPOSITORY" != "/backups/restic" ]]; then
+    gtnhResticError "Invalid Restic repository setting. This stack requires /backups/restic; the supplied value was not logged because it may be sensitive."
+    return 1
+  fi
+}
+
+function isMisplacedGTNHresticRepository(){
+  local candidate="$1"
+  [[ -s "$candidate/config" \
+    && -d "$candidate/data" \
+    && -d "$candidate/index" \
+    && -d "$candidate/keys" \
+    && -d "$candidate/locks" \
+    && -d "$candidate/snapshots" ]]
+}
+
+function findMisplacedGTNHresticRepositories(){
+  local candidate=""
+  for candidate in /data/* /data/.[!.]* /data/..?*; do
+    [[ -d "$candidate" ]] || continue
+    if isMisplacedGTNHresticRepository "$candidate"; then
+      printf '%s\0' "$candidate"
+    fi
+  done
+}
+
 function appendGTNHmanagerEvent(){
   local level="$1"
   shift
@@ -40,6 +67,7 @@ function gtnhResticError(){
 }
 
 function gtnhResticEnvironment(){
+  validateGTNHresticRepository || return 1
   export RESTIC_REPOSITORY="$GTNH_RESTIC_REPOSITORY"
   export RESTIC_PASSWORD_FILE="$GTNH_RESTIC_PASSWORD_FILE"
   export RESTIC_PROGRESS_FPS=1
@@ -49,6 +77,7 @@ function gtnhResticEnvironment(){
 function writeGTNHresticExcludes(){
   local excludes_file="$GTNH_MANAGER_DIR/restic-excludes.txt"
   local excludes_tmp="${excludes_file}.tmp.$$"
+  local shared_excludes="/backups/.gtnh-restic-source-excludes"
 
   mkdir -p "$GTNH_MANAGER_DIR"
   cat > "$excludes_tmp" <<'EOF'
@@ -67,6 +96,9 @@ journeymap
 World-*.zip
 *.jar
 EOF
+  if [[ -s "$shared_excludes" ]]; then
+    cat "$shared_excludes" >> "$excludes_tmp"
+  fi
   mv -f "$excludes_tmp" "$excludes_file"
   printf '%s\n' "$excludes_file"
 }
@@ -74,6 +106,7 @@ EOF
 function initializeGTNHresticRepository(){
   local init_output=""
 
+  validateGTNHresticRepository || return 1
   if ! command -v restic >/dev/null 2>&1; then
     gtnhResticError "Restic is not installed in the GTNH image."
     return 1
@@ -84,12 +117,12 @@ function initializeGTNHresticRepository(){
   fi
 
   mkdir -p "$GTNH_RESTIC_REPOSITORY" "$GTNH_MANAGER_DIR" "${GTNH_RESTIC_CACHE_DIR:-$GTNH_MANAGER_DIR/restic-cache}"
-  gtnhResticEnvironment
+  gtnhResticEnvironment || return 1
   if restic cat config >/dev/null 2>&1; then
     return 0
   fi
 
-  gtnhResticLog "Initializing incremental backup repository at $GTNH_RESTIC_REPOSITORY."
+  gtnhResticLog "Initializing the incremental backup repository at /backups/restic."
   if init_output="$(restic init --repository-version 2 2>&1)"; then
     [[ -n "$init_output" ]] && gtnhResticLog "$init_output"
     return 0
@@ -105,7 +138,7 @@ function initializeGTNHresticRepository(){
 function gtnhResticSnapshotExists(){
   local snapshot_id="$1"
   [[ -n "$snapshot_id" ]] || return 1
-  gtnhResticEnvironment
+  gtnhResticEnvironment || return 1
   restic cat snapshot "$snapshot_id" >/dev/null 2>&1
 }
 
@@ -114,7 +147,7 @@ function forgetOldGTNHpreUpdateSnapshots(){
     gtnhResticError "GTNH_PRE_UPDATE_SNAPSHOTS_KEEP must be a positive integer."
     return 1
   fi
-  gtnhResticEnvironment
+  gtnhResticEnvironment || return 1
   restic --retry-lock "$GTNH_RESTIC_RETRY_LOCK" forget \
     --host "$GTNH_RESTIC_HOSTNAME" \
     --tag gtnh,pre-upgrade \
@@ -153,7 +186,11 @@ function renderGTNHresticEvent(){
       files_done="$(jq -r '.files_done // 0' <<< "$event")"
       total_files="$(jq -r '.total_files // 0' <<< "$event")"
       seconds_remaining="$(jq -r '.seconds_remaining // 0' <<< "$event")"
-      gtnhResticLog "Snapshot progress: ${percent}% ($(( bytes_done / 1024 / 1024 ))/$(( total_bytes / 1024 / 1024 )) MiB, ${files_done}/${total_files} files, ETA ${seconds_remaining}s)."
+      if (( percent > 100 || bytes_done > total_bytes || seconds_remaining > 86400 )); then
+        gtnhResticLog "Snapshot progress: recalculating ($(( bytes_done / 1024 / 1024 )) MiB scanned, ${files_done} files)."
+      else
+        gtnhResticLog "Snapshot progress: ${percent}% ($(( bytes_done / 1024 / 1024 ))/$(( total_bytes / 1024 / 1024 )) MiB, ${files_done}/${total_files} files, ETA ${seconds_remaining}s)."
+      fi
       GTNH_RESTIC_LAST_PROGRESS_EPOCH="$now_epoch"
       ;;
     summary)
@@ -202,7 +239,7 @@ function createGTNHresticSnapshot(){
   mkfifo "$fifo"
   : > "$json_log"
   GTNH_RESTIC_SNAPSHOT_ID=""
-  gtnhResticEnvironment
+  gtnhResticEnvironment || return 1
 
   backup_args=(
     --retry-lock "$GTNH_RESTIC_RETRY_LOCK"

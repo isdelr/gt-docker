@@ -58,7 +58,10 @@ function managerValue(){
 }
 
 function latestSnapshot(){
-  gtnhResticEnvironment
+  if ! gtnhResticEnvironment; then
+    printf 'invalid repository configuration\n'
+    return
+  fi
   if [[ ! -s "$GTNH_RESTIC_PASSWORD_FILE" ]] || ! restic cat config >/dev/null 2>&1; then
     printf 'repository not initialized\n'
     return
@@ -98,14 +101,12 @@ function statusCommand(){
 }
 
 function snapshotsCommand(){
-  gtnhResticEnvironment
   initializeGTNHresticRepository || exit 1
   heading "Restic snapshots"
   restic snapshots --host "$GTNH_RESTIC_HOSTNAME" --compact "$@"
 }
 
 function checkCommand(){
-  gtnhResticEnvironment
   initializeGTNHresticRepository || exit 1
   heading "Restic repository check"
   restic --retry-lock "$GTNH_RESTIC_RETRY_LOCK" check "$@"
@@ -241,7 +242,7 @@ function restoreCommand(){
     exit 1
   fi
 
-  gtnhResticEnvironment
+  gtnhResticEnvironment || exit 1
   if [[ ! -s "$GTNH_RESTIC_PASSWORD_FILE" ]] || ! restic cat config >/dev/null 2>&1; then
     printf 'The Restic repository is unavailable or cannot be opened.\n' >&2
     exit 1
@@ -380,10 +381,87 @@ function legacyRestoreCommand(){
   fi
 }
 
+function cleanupMisplacedResticCommand(){
+  local candidate=""
+  local cleaned=0
+  local confirmation="${1:-}"
+  local last_verified=""
+  local now=""
+  local redact_file="/tmp/gtnh-redact-values.$$"
+  local snapshot_id=""
+  local -a repositories=()
+
+  mapfile -d '' repositories < <(findMisplacedGTNHresticRepositories)
+  heading "Misplaced Restic cleanup"
+  row "Repositories found" "${#repositories[@]}"
+  if (( ${#repositories[@]} == 0 )); then
+    printf 'Nothing needs cleanup.\n'
+    return
+  fi
+  if [[ "$confirmation" != "--confirm" ]]; then
+    printf 'Run gtnhctl cleanup-misplaced-restic --confirm only after a fresh /backups/restic snapshot is verified.\n' >&2
+    exit 2
+  fi
+
+  gtnhResticEnvironment || exit 1
+  if [[ ! -s /backups/.last-restic-snapshot || ! -s /backups/.last-verified ]]; then
+    printf 'Refusing cleanup: no verified snapshot marker exists for the fixed repository.\n' >&2
+    exit 1
+  fi
+  snapshot_id="$(cat /backups/.last-restic-snapshot)"
+  last_verified="$(cat /backups/.last-verified)"
+  now="$(date +%s)"
+  if [[ ! "$last_verified" =~ ^[0-9]+$ ]] || (( now - last_verified > 46800 )); then
+    printf 'Refusing cleanup: the latest verified snapshot is more than 13 hours old.\n' >&2
+    exit 1
+  fi
+  if ! restic cat snapshot "$snapshot_id" >/dev/null 2>&1; then
+    printf 'Refusing cleanup: the verified snapshot cannot be opened from /backups/restic.\n' >&2
+    exit 1
+  fi
+
+  umask 077
+  : > "$redact_file"
+  for candidate in "${repositories[@]}"; do
+    candidate="$(realpath -m "$candidate")"
+    if [[ "$(dirname "$candidate")" != "/data" ]] || ! isMisplacedGTNHresticRepository "$candidate"; then
+      printf 'Refusing cleanup: a detected path failed its final safety check.\n' >&2
+      rm -f "$redact_file"
+      exit 1
+    fi
+    basename "$candidate" >> "$redact_file"
+    rm -rf -- "$candidate"
+    cleaned=$((cleaned + 1))
+  done
+
+  REDACT_FILE="$redact_file" python3 - <<'PY'
+import os
+from pathlib import Path
+
+values = [value for value in Path(os.environ["REDACT_FILE"]).read_bytes().splitlines() if value]
+for target in (Path("/data/.gtnh-manager/events.log"), Path("/data/.gtnh-manager/restic-last.jsonl")):
+    if not target.is_file():
+        continue
+    content = target.read_bytes()
+    redacted = content
+    for value in values:
+        redacted = redacted.replace(value, b"[redacted-misconfigured-repository]")
+    if redacted != content:
+        temporary = target.with_name(f"{target.name}.tmp.{os.getpid()}")
+        temporary.write_bytes(redacted)
+        os.replace(temporary, target)
+PY
+  rm -f "$redact_file"
+  : > /backups/.gtnh-restic-source-excludes
+  printf 'Removed %s misplaced repository and redacted its name from manager logs.\n' "$cleaned"
+}
+
 function doctorCommand(){
   local available_kb=""
   local failed=0
+  local misplaced_count=0
   local required_kb=""
+  local candidate=""
 
   heading "GTNH diagnostics"
   if [[ -d /data && -w /data ]]; then
@@ -417,11 +495,21 @@ function doctorCommand(){
     printf '%s[FAIL]%s Restic password file is missing\n' "$C_RED" "$C_RESET"
     failed=1
   fi
-  gtnhResticEnvironment
-  if restic cat config >/dev/null 2>&1; then
-    printf '%s[OK]%s   Restic repository opens successfully\n' "$C_GREEN" "$C_RESET"
+  while IFS= read -r -d '' candidate; do
+    misplaced_count=$((misplaced_count + 1))
+  done < <(findMisplacedGTNHresticRepositories)
+  if (( misplaced_count > 0 )); then
+    printf '%s[WARN]%s %s misplaced Restic repository found under /data and excluded from backups\n' "$C_YELLOW" "$C_RESET" "$misplaced_count"
   else
-    printf '%s[WARN]%s Restic repository has not been initialized\n' "$C_YELLOW" "$C_RESET"
+    printf '%s[OK]%s   No misplaced Restic repository exists under /data\n' "$C_GREEN" "$C_RESET"
+  fi
+  if ! validateGTNHresticRepository; then
+    printf '%s[FAIL]%s Restic repository configuration is unsafe\n' "$C_RED" "$C_RESET"
+    failed=1
+  elif gtnhResticEnvironment && restic cat config >/dev/null 2>&1; then
+    printf '%s[OK]%s   Fixed Restic repository opens successfully\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s[WARN]%s Fixed Restic repository has not been initialized\n' "$C_YELLOW" "$C_RESET"
   fi
   if [[ ! -e "$STATE_FILE" ]] || jq -e . "$STATE_FILE" >/dev/null 2>&1; then
     printf '%s[OK]%s   Manager state is valid\n' "$C_GREEN" "$C_RESET"
@@ -471,6 +559,8 @@ Commands:
   check [args]        Check Restic repository metadata or pass --read-data-subset
   restore SNAPSHOT    Stage and verify a snapshot restore without overwriting /data
   legacy-restore FILE Inspect or stage one explicitly named old tar/ZIP backup
+  cleanup-misplaced-restic
+                      Remove an accidentally nested repository after verification
   cache [list]        List persistent verified GTNH artifacts
   cache prune [keep]  Retain only the most recently used verified artifacts
   logs [lines] [-f]   Show or follow persisted update-manager events
@@ -496,6 +586,7 @@ case "$command_name" in
   check) checkCommand "$@" ;;
   restore) restoreCommand "$@" ;;
   legacy-restore) legacyRestoreCommand "$@" ;;
+  cleanup-misplaced-restic) cleanupMisplacedResticCommand "$@" ;;
   cache) cacheCommand "$@" ;;
   logs) logsCommand "$@" ;;
   doctor) doctorCommand ;;

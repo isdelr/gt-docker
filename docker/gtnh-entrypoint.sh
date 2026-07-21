@@ -12,6 +12,72 @@ is_true() {
   esac
 }
 
+validate_restic_configuration() {
+  repository="${GTNH_RESTIC_REPOSITORY:-/backups/restic}"
+  password_file="${GTNH_RESTIC_PASSWORD_FILE:-/backups/.gtnh-restic-password}"
+
+  if [ "$repository" != "/backups/restic" ]; then
+    log "Invalid Restic repository setting. This stack requires /backups/restic; the supplied value was not logged because it may be sensitive."
+    exit 1
+  fi
+  if [ "$password_file" != "/backups/.gtnh-restic-password" ]; then
+    log "Invalid Restic password-file setting. This stack requires /backups/.gtnh-restic-password."
+    exit 1
+  fi
+
+  export GTNH_RESTIC_REPOSITORY="$repository"
+  export GTNH_RESTIC_PASSWORD_FILE="$password_file"
+}
+
+is_restic_repository_directory() {
+  candidate="$1"
+  [ -s "$candidate/config" ] \
+    && [ -d "$candidate/data" ] \
+    && [ -d "$candidate/index" ] \
+    && [ -d "$candidate/keys" ] \
+    && [ -d "$candidate/locks" ] \
+    && [ -d "$candidate/snapshots" ]
+}
+
+password_was_exposed_as_repository() {
+  password="$1"
+  [ -n "$password" ] || return 1
+
+  for candidate in /data/* /data/.[!.]* /data/..?*; do
+    [ -d "$candidate" ] || continue
+    if [ "$(basename "$candidate")" = "$password" ] && is_restic_repository_directory "$candidate"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+prepare_restic_source_excludes() {
+  excludes_file="/backups/.gtnh-restic-source-excludes"
+  excludes_tmp="${excludes_file}.tmp.$$"
+  misplaced_count=0
+
+  : > "$excludes_tmp"
+  for candidate in /data/* /data/.[!.]* /data/..?*; do
+    [ -d "$candidate" ] || continue
+    if is_restic_repository_directory "$candidate"; then
+      escaped_name="$(basename "$candidate" | sed 's/[][?*\\]/\\&/g')"
+      printf '/%s\n' "$escaped_name" >> "$excludes_tmp"
+      misplaced_count=$((misplaced_count + 1))
+    fi
+  done
+  mv -f "$excludes_tmp" "$excludes_file"
+  chmod 600 "$excludes_file"
+  # shellcheck disable=SC3028
+  if [ "$(id -u)" = "0" ]; then
+    chown "${UID:-1000}:${GID:-1000}" "$excludes_file"
+  fi
+
+  if [ "$misplaced_count" -gt 0 ]; then
+    log "Detected $misplaced_count misplaced Restic repository under /data; it will be excluded from all new backups until explicitly cleaned up."
+  fi
+}
+
 prepare_backup_volume() {
   backup_dir="/backups"
   # UID and GID are injected by the itzg image/Compose contract.
@@ -39,16 +105,32 @@ prepare_backup_volume() {
 
 prepare_restic_credentials() {
   password_file="${GTNH_RESTIC_PASSWORD_FILE:-/backups/.gtnh-restic-password}"
+  repository="${GTNH_RESTIC_REPOSITORY:-/backups/restic}"
   configured_password="${GTNH_RESTIC_PASSWORD:-}"
   # shellcheck disable=SC3028
   target_uid="${UID:-1000}"
   target_gid="${GID:-1000}"
 
   if [ -s "$password_file" ]; then
-    if [ -n "$configured_password" ] && [ "$(cat "$password_file")" != "$configured_password" ]; then
-      log "GTNH_RESTIC_PASSWORD does not match the existing Restic repository password file."
+    stored_password="$(cat "$password_file")"
+    if password_was_exposed_as_repository "$stored_password" \
+      && { [ -z "$configured_password" ] || [ "$stored_password" = "$configured_password" ]; }; then
+      stored_password=""
+      log "The current Restic password was exposed as a repository path. Rotate GTNH_RESTIC_PASSWORD in Coolify before restarting."
       exit 1
     fi
+    if [ -n "$configured_password" ] && [ "$stored_password" != "$configured_password" ]; then
+      if [ ! -s "$repository/config" ]; then
+        umask 077
+        printf '%s\n' "$configured_password" > "$password_file"
+        log "Replaced the password file for the uninitialized fixed Restic repository."
+      else
+        stored_password=""
+        log "GTNH_RESTIC_PASSWORD does not match the initialized Restic repository password file. Rotate the repository key explicitly."
+        exit 1
+      fi
+    fi
+    stored_password=""
   else
     umask 077
     mkdir -p "$(dirname "$password_file")"
@@ -81,8 +163,10 @@ maybe_auto_confirm_forge_queries() {
   log "AUTO_CONFIRM_FORGE_QUERIES=true; setting fml.queryResult:confirm"
 }
 
+validate_restic_configuration
 prepare_backup_volume
 prepare_restic_credentials
+prepare_restic_source_excludes
 maybe_auto_confirm_forge_queries
 
 exec /start "$@"

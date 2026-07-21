@@ -35,7 +35,7 @@ services:
       GTNH_PACK_SHA256: ${GTNH_PACK_SHA256:-}
       GTNH_GITHUB_TOKEN: ${GTNH_GITHUB_TOKEN:-}
       GTNH_PRE_UPDATE_BACKUP: ${GTNH_PRE_UPDATE_BACKUP:-true}
-      GTNH_RESTIC_REPOSITORY: ${GTNH_RESTIC_REPOSITORY:-/backups/restic}
+      GTNH_RESTIC_REPOSITORY: /backups/restic
       GTNH_RESTIC_PASSWORD: ${GTNH_RESTIC_PASSWORD:-}
       GTNH_RESTIC_PASSWORD_FILE: /backups/.gtnh-restic-password
       GTNH_RESTIC_HOSTNAME: ${GTNH_RESTIC_HOSTNAME:-gtnh}
@@ -97,13 +97,14 @@ services:
       BACKUP_ON_STARTUP: "true"
       BACKUP_METHOD: restic
       ENABLE_SYNC: "false"
-      RESTIC_REPOSITORY: ${GTNH_RESTIC_REPOSITORY:-/backups/restic}
+      RESTIC_REPOSITORY: /backups/restic
       RESTIC_PASSWORD_FILE: /backups/.gtnh-restic-password
       RESTIC_CACHE_DIR: /tmp/restic-cache
       RESTIC_HOSTNAME: ${GTNH_RESTIC_HOSTNAME:-gtnh}
       RESTIC_ADDITIONAL_TAGS: scheduled
       RESTIC_RETRY_LOCK: ${GTNH_RESTIC_RETRY_LOCK:-5m}
       GTNH_BACKUP_MIN_FREE_GB: ${GTNH_BACKUP_MIN_FREE_GB:-20}
+      EXCLUDES_FILE: /backups/.gtnh-restic-source-excludes
       PRUNE_RESTIC_RETENTION: ${PRUNE_RESTIC_RETENTION:---keep-within 24h --keep-daily 7 --keep-weekly 4 --keep-monthly 3}
       EXCLUDES: ${BACKUP_EXCLUDES:-*.jar,cache,logs,*.tmp,backups,.gtnh-manager,.gtnh-recovery,gtnh-upgrade-*,World-*.zip,packs}
       RCON_RETRIES: "30"
