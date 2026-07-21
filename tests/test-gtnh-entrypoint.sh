@@ -40,6 +40,14 @@ fi
 GTNH_RESTIC_PASSWORD="$new_password" runEntrypointPreparation
 [[ "$(cat /backups/.gtnh-restic-password)" == "$new_password" ]]
 grep -Fqx "/$old_password" /backups/.gtnh-restic-source-excludes
+grep -Fqx "/data/$old_password" /backups/.gtnh-restic-source-excludes
+grep -Fqx '/data/.gtnh-manager' /backups/.gtnh-restic-source-excludes
+[[ -d /backups/.gtnh-restic-cache ]]
+
+mkdir -p /data/.gtnh-manager/restic-cache
+printf 'obsolete-cache-data\n' > /data/.gtnh-manager/restic-cache/index
+GTNH_RESTIC_PASSWORD="$new_password" runEntrypointPreparation
+[[ ! -e /data/.gtnh-manager/restic-cache ]]
 
 RESTIC_REPOSITORY=/backups/restic \
   RESTIC_PASSWORD_FILE=/backups/.gtnh-restic-password \

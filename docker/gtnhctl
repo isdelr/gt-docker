@@ -452,7 +452,16 @@ for target in (Path("/data/.gtnh-manager/events.log"), Path("/data/.gtnh-manager
         os.replace(temporary, target)
 PY
   rm -f "$redact_file"
-  : > /backups/.gtnh-restic-source-excludes
+  cat > /backups/.gtnh-restic-source-excludes <<'EOF'
+/.gtnh-manager
+/data/.gtnh-manager
+/.gtnh-recovery
+/data/.gtnh-recovery
+/packs
+/data/packs
+/gtnh-upgrade-*
+/data/gtnh-upgrade-*
+EOF
   printf 'Removed %s misplaced repository and redacted its name from manager logs.\n' "$cleaned"
 }
 

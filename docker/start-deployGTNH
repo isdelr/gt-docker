@@ -1040,8 +1040,9 @@ function setGTNHconfigValue() {
   log "Applied GTNH setting $key=$value in $file"
 }
 
-function applyGTNHBackupDefaults() {
+function applyGTNHConfigOverrides() {
   local serverutilities="/data/serverutilities/serverutilities.cfg"
+  local hodgepodge="/data/config/hodgepodge.cfg"
 
   setGTNHconfigValue "$serverutilities" "S:backup_timer" "${GTNH_INTERNAL_BACKUP_TIMER:-0.5}"
   setGTNHconfigValue "$serverutilities" "I:backups_to_keep" "${GTNH_INTERNAL_BACKUPS_TO_KEEP:-24}"
@@ -1049,6 +1050,8 @@ function applyGTNHBackupDefaults() {
   setGTNHconfigValue "$serverutilities" "I:compression_level" "${GTNH_INTERNAL_BACKUP_COMPRESSION:-4}"
   setGTNHconfigValue "$serverutilities" "B:only_backup_claimed_chunks" "${GTNH_INTERNAL_BACKUP_CLAIMED_ONLY:-true}"
   setGTNHconfigValue "$serverutilities" "B:backup_entire_regions_with_claims" "${GTNH_INTERNAL_BACKUP_WHOLE_REGIONS:-true}"
+  setGTNHconfigValue "$hodgepodge" "B:poolZlibInstances" "${GTNH_HODGEPODGE_POOL_ZLIB_INSTANCES:-false}"
+  setGTNHconfigValue "$hodgepodge" "B:speedupChunkCompression" "${GTNH_HODGEPODGE_SPEEDUP_CHUNK_COMPRESSION:-false}"
 }
 
 function main(){
@@ -1080,7 +1083,7 @@ function main(){
   export VERSION=1.7.10
 
   handleGTNH
-  applyGTNHBackupDefaults
+  applyGTNHConfigOverrides
 
   export USES_MODS=true
   cleanupGTNHtemporaryFiles

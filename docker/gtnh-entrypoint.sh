@@ -57,12 +57,21 @@ prepare_restic_source_excludes() {
   excludes_tmp="${excludes_file}.tmp.$$"
   misplaced_count=0
 
-  : > "$excludes_tmp"
+  cat > "$excludes_tmp" <<'EOF'
+/.gtnh-manager
+/data/.gtnh-manager
+/.gtnh-recovery
+/data/.gtnh-recovery
+/packs
+/data/packs
+/gtnh-upgrade-*
+/data/gtnh-upgrade-*
+EOF
   for candidate in /data/* /data/.[!.]* /data/..?*; do
     [ -d "$candidate" ] || continue
     if is_restic_repository_directory "$candidate"; then
       escaped_name="$(basename "$candidate" | sed 's/[][?*\\]/\\&/g')"
-      printf '/%s\n' "$escaped_name" >> "$excludes_tmp"
+      printf '/%s\n/data/%s\n' "$escaped_name" "$escaped_name" >> "$excludes_tmp"
       misplaced_count=$((misplaced_count + 1))
     fi
   done
@@ -78,6 +87,14 @@ prepare_restic_source_excludes() {
   fi
 }
 
+remove_legacy_restic_cache() {
+  legacy_cache="/data/.gtnh-manager/restic-cache"
+  [ -e "$legacy_cache" ] || return 0
+
+  log "Removing the obsolete Restic cache from /data; future cache data is stored under /backups."
+  rm -rf -- "$legacy_cache"
+}
+
 prepare_backup_volume() {
   backup_dir="/backups"
   # UID and GID are injected by the itzg image/Compose contract.
@@ -86,12 +103,14 @@ prepare_backup_volume() {
   target_gid="${GID:-1000}"
 
   if [ "$(id -u)" = "0" ]; then
-    mkdir -p "$backup_dir"
+    mkdir -p "$backup_dir" "$backup_dir/.gtnh-restic-cache"
     if [ "$(stat -c '%u:%g' "$backup_dir")" != "${target_uid}:${target_gid}" ]; then
       log "Changing ownership of $backup_dir to ${target_uid}:${target_gid} for Restic snapshots."
       chown "${target_uid}:${target_gid}" "$backup_dir"
     fi
     chmod u+rwx "$backup_dir"
+    chown "${target_uid}:${target_gid}" "$backup_dir/.gtnh-restic-cache"
+    chmod 700 "$backup_dir/.gtnh-restic-cache"
 
     if command -v gosu >/dev/null 2>&1 && ! gosu "${target_uid}:${target_gid}" test -w "$backup_dir"; then
       log "Backup directory is not writable by ${target_uid}:${target_gid}: $backup_dir"
@@ -165,6 +184,7 @@ maybe_auto_confirm_forge_queries() {
 
 validate_restic_configuration
 prepare_backup_volume
+remove_legacy_restic_cache
 prepare_restic_credentials
 prepare_restic_source_excludes
 maybe_auto_confirm_forge_queries

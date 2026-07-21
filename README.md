@@ -53,6 +53,7 @@ Coolify treats `docker-compose.yml` as the source of truth, and it auto-detects 
 - Tested daily builds use identifiers such as `daily-2026-07-19+630`. They come from DreamAssemblerXXL Actions, not the config-only nightly release ZIP.
 - Daily artifact downloads require `GTNH_GITHUB_TOKEN`, stored as a Coolify secret with read-only GitHub Actions access.
 - `ENABLE_WHITELIST=true` and `ENFORCE_WHITELIST=true` means nobody can join until you add them.
+- Hodgepodge's `poolZlibInstances` and `speedupChunkCompression` options are forced off after every install or update by default.
 - The Minecraft TCP port is mapped with `MC_PORT`, while the in-game server binds to `SERVER_PORT`.
 - Query is off by default. If you enable it, the compose file already maps the configured UDP query port.
 
@@ -131,7 +132,7 @@ An OVH hard reset can bypass userspace shutdown hooks, so verified backups remai
 
 ## Backups
 
-The `gtnh-backups` service waits for Minecraft health, loads the image-generated RCON credential from the shared `/data/.rcon-cli.env`, then coordinates `save-off`, `save-all flush`, and `save-on`. It creates a deduplicated Restic snapshot every 12 hours. The storage-conscious default keeps snapshots from the last 24 hours, seven daily, four weekly, and three monthly restore points. Policies overlap, so Restic does not retain a separate duplicate for every rule. Internal backup trees, recovery snapshots, upgrade snapshots, logs, caches, jars, and downloaded packs are excluded.
+The `gtnh-backups` service waits for Minecraft health, loads the image-generated RCON credential from the shared `/data/.rcon-cli.env`, then coordinates `save-off`, `save-all flush`, and `save-on`. It creates a deduplicated Restic snapshot every 12 hours. The storage-conscious default keeps snapshots from the last 24 hours, seven daily, four weekly, and three monthly restore points. Policies overlap, so Restic does not retain a separate duplicate for every rule. Internal backup trees, recovery snapshots, upgrade snapshots, logs, caches, jars, and downloaded packs are excluded. Restic's own cache lives under `/backups`, outside the source tree. A failed scheduled backup leaves the verification marker unchanged and waits for the next interval instead of restarting into a rapid RCON save loop.
 
 Pre-upgrade and scheduled snapshots share `/backups/restic`. Successful snapshots are reopened by ID before `/backups/.last-verified` is updated, and the backup container becomes unhealthy when that marker is older than 13 hours. New snapshots are refused when less than 20 GiB remains free. Retention cannot guarantee a fixed repository size because world churn varies, so keep the health check and `gtnhctl doctor` monitored.
 

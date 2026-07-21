@@ -30,6 +30,8 @@ services:
       GTNH_INTERNAL_BACKUP_COMPRESSION: ${GTNH_INTERNAL_BACKUP_COMPRESSION:-4}
       GTNH_INTERNAL_BACKUP_CLAIMED_ONLY: ${GTNH_INTERNAL_BACKUP_CLAIMED_ONLY:-true}
       GTNH_INTERNAL_BACKUP_WHOLE_REGIONS: ${GTNH_INTERNAL_BACKUP_WHOLE_REGIONS:-true}
+      GTNH_HODGEPODGE_POOL_ZLIB_INSTANCES: ${GTNH_HODGEPODGE_POOL_ZLIB_INSTANCES:-false}
+      GTNH_HODGEPODGE_SPEEDUP_CHUNK_COMPRESSION: ${GTNH_HODGEPODGE_SPEEDUP_CHUNK_COMPRESSION:-false}
       GTNH_PACK_VERSION: ${GTNH_PACK_VERSION:-2.9.0-beta-2}
       GTNH_PACK_URL: ${GTNH_PACK_URL:-}
       GTNH_PACK_SHA256: ${GTNH_PACK_SHA256:-}
@@ -120,7 +122,10 @@ services:
           exit 1
         fi
       POST_BACKUP_SCRIPT: |
-        [ "$$1" -eq 0 ] || exit "$$1"
+        if [ "$$1" -ne 0 ]; then
+          echo "Backup failed with status $$1; keeping the previous verification marker and waiting for the next interval." >&2
+          exit 0
+        fi
         latest="$$(restic snapshots --host "$${RESTIC_HOSTNAME}" --tag "$${BACKUP_NAME},scheduled" --latest 1 --json | jq -r '.[0].id // empty')"
         test -n "$$latest"
         printf '%s\n' "$$latest" > /backups/.last-restic-snapshot

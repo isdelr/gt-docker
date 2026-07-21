@@ -9,6 +9,7 @@ printf 'test-build\n' > /data/.gtnh-version
 
 # shellcheck source=gtnh-restic.sh
 . /usr/local/lib/gtnh-restic.sh
+[[ "$GTNH_RESTIC_CACHE_DIR" == "/backups/.gtnh-restic-cache" ]]
 
 GTNH_RESTIC_REPOSITORY="relative-secret-shaped-value"
 if validateGTNHresticRepository; then

@@ -246,10 +246,33 @@ function testInterruptedRecovery(){
   [[ ! -e "$GTNH_UPDATE_MARKER" ]]
 }
 
+function testConfigOverrides(){
+  resetData
+  mkdir -p /data/config /data/serverutilities
+  printf '%s\n' \
+    'S:backup_timer=1.0' \
+    'I:backups_to_keep=48' \
+    'I:max_folder_size=35' \
+    'I:compression_level=9' \
+    'B:only_backup_claimed_chunks=false' \
+    'B:backup_entire_regions_with_claims=false' \
+    > /data/serverutilities/serverutilities.cfg
+  printf '%s\n' \
+    '    B:poolZlibInstances=true' \
+    '    B:speedupChunkCompression=true' \
+    > /data/config/hodgepodge.cfg
+
+  applyGTNHConfigOverrides
+
+  assertFileContains /data/config/hodgepodge.cfg '    B:poolZlibInstances=false'
+  assertFileContains /data/config/hodgepodge.cfg '    B:speedupChunkCompression=false'
+}
+
 testDailyResolver
 testArchiveValidation
 testInstalledPinnedDailyNeedsNoArtifact
 testArtifactCacheAndResume
 testTransactionalUpdate
 testInterruptedRecovery
+testConfigOverrides
 echo "GTNH deploy tests passed."
