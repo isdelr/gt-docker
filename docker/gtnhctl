@@ -1,0 +1,508 @@
+#!/bin/bash
+set -uo pipefail
+
+# shellcheck source=gtnh-restic.sh
+. /usr/local/lib/gtnh-restic.sh
+
+STATE_FILE="${GTNH_MANAGER_STATE_FILE:-/data/.gtnh-manager/state.json}"
+ARTIFACT_DIR="${GTNH_ARTIFACT_CACHE_DIR:-/data/packs/artifacts}"
+BACKUP_MIN_FREE_GB="${GTNH_BACKUP_MIN_FREE_GB:-20}"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_RED=$'\033[31m'
+  C_RESET=$'\033[0m'
+else
+  C_BOLD=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_RED=""
+  C_RESET=""
+fi
+
+function heading(){
+  printf '%s%s%s\n' "$C_BOLD" "$1" "$C_RESET"
+  printf '%s\n' '------------------------------------------------------------'
+}
+
+function row(){
+  printf '%-20s %s\n' "$1" "$2"
+}
+
+function humanSize(){
+  local bytes="${1:-0}"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || printf '%s bytes' "$bytes"
+  else
+    printf '%s bytes' "$bytes"
+  fi
+}
+
+function currentVersion(){
+  if [[ -s /data/.gtnh-version ]]; then
+    head -n 1 /data/.gtnh-version
+  else
+    printf 'not installed\n'
+  fi
+}
+
+function managerValue(){
+  local query="$1"
+  if [[ -s "$STATE_FILE" ]] && jq -e . "$STATE_FILE" >/dev/null 2>&1; then
+    jq -r "$query // \"none\"" "$STATE_FILE"
+  else
+    printf 'none\n'
+  fi
+}
+
+function latestSnapshot(){
+  gtnhResticEnvironment
+  if [[ ! -s "$GTNH_RESTIC_PASSWORD_FILE" ]] || ! restic cat config >/dev/null 2>&1; then
+    printf 'repository not initialized\n'
+    return
+  fi
+  restic snapshots --host "$GTNH_RESTIC_HOSTNAME" --latest 1 --json 2>/dev/null \
+    | jq -r '.[0] | if . == null then "none" else "\(.short_id // .id[0:8]) at \(.time)" end'
+}
+
+function cacheBytes(){
+  if [[ -d "$ARTIFACT_DIR" ]]; then
+    find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.zip' -printf '%s\n' 2>/dev/null \
+      | awk '{total += $1} END {print total + 0}'
+  else
+    printf '0\n'
+  fi
+}
+
+function statusCommand(){
+  local verified_age="never"
+  local verified_epoch=""
+
+  heading "GTNH update manager"
+  row "Current build" "$(currentVersion)"
+  row "Target build" "$(managerValue '.target')"
+  row "Operation stage" "$(managerValue '.stage')"
+  row "Operation ID" "$(managerValue '.operation_id')"
+  row "Safety snapshot" "$(managerValue '.snapshot_id')"
+  row "Last snapshot" "$(latestSnapshot)"
+  row "Artifact cache" "$(humanSize "$(cacheBytes)")"
+  if [[ -s /backups/.last-verified ]]; then
+    verified_epoch="$(cat /backups/.last-verified)"
+    verified_age="$(( $(date +%s) - verified_epoch )) seconds ago"
+  fi
+  row "Backup verified" "$verified_age"
+  row "Data filesystem" "$(df -h /data | awk 'NR == 2 {print $4 " free of " $2}')"
+  row "Backup filesystem" "$(df -h /backups | awk 'NR == 2 {print $4 " free of " $2}')"
+}
+
+function snapshotsCommand(){
+  gtnhResticEnvironment
+  initializeGTNHresticRepository || exit 1
+  heading "Restic snapshots"
+  restic snapshots --host "$GTNH_RESTIC_HOSTNAME" --compact "$@"
+}
+
+function checkCommand(){
+  gtnhResticEnvironment
+  initializeGTNHresticRepository || exit 1
+  heading "Restic repository check"
+  restic --retry-lock "$GTNH_RESTIC_RETRY_LOCK" check "$@"
+}
+
+function cacheCommand(){
+  local action="${1:-list}"
+  local keep="${2:-${GTNH_ARTIFACT_CACHE_KEEP:-2}}"
+  local artifact=""
+  local artifact_count=0
+  local digest=""
+  local index_file=""
+
+  if [[ "$action" == "prune" ]]; then
+    if [[ ! "$keep" =~ ^[1-9][0-9]*$ ]]; then
+      printf 'Cache retention must be a positive integer.\n' >&2
+      exit 2
+    fi
+    while IFS= read -r artifact; do
+      artifact_count=$((artifact_count + 1))
+      if (( artifact_count > keep )); then
+        printf 'Removing %s\n' "$(basename "$artifact")"
+        rm -f "$artifact"
+      fi
+    done < <(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.zip' -printf '%T@|%p\n' 2>/dev/null \
+      | sort -t '|' -k 1,1nr | cut -d '|' -f 2-)
+    if [[ -d "$ARTIFACT_DIR/index" ]]; then
+      while IFS= read -r index_file; do
+        digest="$(jq -r '.digest // empty' "$index_file" 2>/dev/null || true)"
+        if [[ -z "$digest" || ! -s "$ARTIFACT_DIR/${digest}.zip" ]]; then
+          rm -f "$index_file"
+        fi
+      done < <(find "$ARTIFACT_DIR/index" -maxdepth 1 -type f -name '*.json')
+    fi
+    printf 'Cache pruned to the %s most recently used artifacts.\n' "$keep"
+    return
+  elif [[ "$action" != "list" ]]; then
+    printf 'Unknown cache action: %s\n' "$action" >&2
+    exit 2
+  fi
+
+  heading "Verified artifact cache"
+  if [[ ! -d "$ARTIFACT_DIR" ]]; then
+    printf 'Cache is empty.\n'
+    return
+  fi
+  find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.zip' -printf '%s|%TY-%Tm-%Td %TH:%TM|%f\n' \
+    | sort -t '|' -k 2,2r \
+    | while IFS='|' read -r bytes modified name; do
+        printf '%-10s  %-16s  %s\n' "$(humanSize "$bytes")" "$modified" "$name"
+      done
+}
+
+function logsCommand(){
+  local lines=80
+  local follow=false
+  local arg=""
+  local event_log="${GTNH_MANAGER_DIR}/events.log"
+  local -a tail_args=()
+
+  for arg in "$@"; do
+    case "$arg" in
+      --follow|-f) follow=true ;;
+      [1-9][0-9]*) lines="$arg" ;;
+      *)
+        printf 'Usage: gtnhctl logs [lines] [--follow]\n' >&2
+        exit 2
+        ;;
+    esac
+  done
+  heading "GTNH manager events"
+  if [[ ! -s "$event_log" ]]; then
+    printf 'No manager events have been recorded yet.\n'
+    return
+  fi
+  tail_args=(-n "$lines")
+  $follow && tail_args+=(-F)
+  tail "${tail_args[@]}" "$event_log"
+}
+
+function restoreCommand(){
+  local snapshot="${1:-}"
+  local target=""
+  local world=""
+  local dry_run=false
+  local safe_snapshot=""
+  local arg=""
+  local -a restore_args=()
+
+  if [[ -z "$snapshot" ]]; then
+    printf 'Usage: gtnhctl restore SNAPSHOT [--world NAME] [--target DIR] [--dry-run]\n' >&2
+    exit 2
+  fi
+  shift
+  while (( $# > 0 )); do
+    arg="$1"
+    case "$arg" in
+      --world)
+        [[ $# -ge 2 ]] || { printf '%s requires a value.\n' "$arg" >&2; exit 2; }
+        world="$2"
+        shift 2
+        ;;
+      --target)
+        [[ $# -ge 2 ]] || { printf '%s requires a value.\n' "$arg" >&2; exit 2; }
+        target="$2"
+        shift 2
+        ;;
+      --dry-run)
+        dry_run=true
+        shift
+        ;;
+      *)
+        printf 'Unknown restore option: %s\n' "$arg" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  if [[ -n "$world" && ( "$world" == */* || "$world" == *..* ) ]]; then
+    printf 'World name must be a single safe directory name.\n' >&2
+    exit 2
+  fi
+  safe_snapshot="$(printf '%s' "$snapshot" | tr -c 'A-Za-z0-9._-' '_')"
+  target="${target:-/data/.gtnh-recovery/restic-restore-${safe_snapshot}-$(date -u +%Y%m%dT%H%M%SZ)}"
+  case "$target" in
+    /|/data)
+      printf 'Refusing to stage a restore directly over %s.\n' "$target" >&2
+      exit 2
+      ;;
+  esac
+  if [[ -d "$target" ]] && find "$target" -mindepth 1 -print -quit | grep -q .; then
+    printf 'Restore target is not empty: %s\n' "$target" >&2
+    exit 1
+  fi
+
+  gtnhResticEnvironment
+  if [[ ! -s "$GTNH_RESTIC_PASSWORD_FILE" ]] || ! restic cat config >/dev/null 2>&1; then
+    printf 'The Restic repository is unavailable or cannot be opened.\n' >&2
+    exit 1
+  fi
+  restore_args=(--retry-lock "$GTNH_RESTIC_RETRY_LOCK" restore "$snapshot" --target "$target" --verify --verbose=1)
+  [[ "$snapshot" != "latest" ]] || restore_args+=(--host "$GTNH_RESTIC_HOSTNAME")
+  [[ -z "$world" ]] || restore_args+=(--include "/$world")
+  $dry_run && restore_args+=(--dry-run --verbose=2)
+
+  heading "Staged Restic restore"
+  row "Snapshot" "$snapshot"
+  row "Target" "$target"
+  [[ -z "$world" ]] || row "World filter" "$world"
+  $dry_run && row "Mode" "dry run"
+  restic "${restore_args[@]}"
+  if ! $dry_run; then
+    printf '\nRestore staged at %s; live /data was not overwritten.\n' "$target"
+  fi
+}
+
+function legacyMembersAreSafe(){
+  local member=""
+  while IFS= read -r member; do
+    member="${member#./}"
+    case "$member" in
+      /*|../*|*/../*|..|[A-Za-z]:*) return 1 ;;
+    esac
+  done
+}
+
+function legacyRestoreCommand(){
+  local archive="${1:-}"
+  local target=""
+  local dry_run=false
+  local safe_name=""
+
+  if [[ -z "$archive" || ! -f "$archive" ]]; then
+    printf 'Usage: gtnhctl legacy-restore ARCHIVE [--target DIR] [--dry-run]\n' >&2
+    exit 2
+  fi
+  shift
+  while (( $# > 0 )); do
+    case "$1" in
+      --target)
+        [[ $# -ge 2 ]] || { printf '%s requires a value.\n' "$1" >&2; exit 2; }
+        target="$2"
+        shift 2
+        ;;
+      --dry-run)
+        dry_run=true
+        shift
+        ;;
+      *)
+        printf 'Unknown legacy restore option: %s\n' "$1" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  safe_name="$(basename "$archive" | tr -c 'A-Za-z0-9._-' '_')"
+  target="${target:-/data/.gtnh-recovery/legacy-restore-${safe_name}-$(date -u +%Y%m%dT%H%M%SZ)}"
+  case "$target" in
+    /|/data)
+      printf 'Refusing to extract a legacy archive directly over %s.\n' "$target" >&2
+      exit 2
+      ;;
+  esac
+  if [[ -d "$target" ]] && find "$target" -mindepth 1 -print -quit | grep -q .; then
+    printf 'Restore target is not empty: %s\n' "$target" >&2
+    exit 1
+  fi
+
+  heading "Legacy archive inspection"
+  row "Archive" "$archive"
+  row "Target" "$target"
+  $dry_run && row "Mode" "dry run"
+  case "$archive" in
+    *.zip)
+      unzip -tq "$archive" >/dev/null
+      if ! zipinfo -1 "$archive" | legacyMembersAreSafe; then
+        printf 'Legacy ZIP contains an unsafe path.\n' >&2
+        exit 1
+      fi
+      if $dry_run; then
+        unzip -l "$archive"
+      else
+        mkdir -p "$target"
+        unzip -q "$archive" -d "$target"
+      fi
+      ;;
+    *.tgz|*.tar.gz)
+      gzip -t "$archive"
+      if ! tar -tzf "$archive" | legacyMembersAreSafe; then
+        printf 'Legacy tar archive contains an unsafe path.\n' >&2
+        exit 1
+      fi
+      if $dry_run; then
+        tar -tzf "$archive"
+      else
+        mkdir -p "$target"
+        tar -xzf "$archive" -C "$target"
+      fi
+      ;;
+    *.tar.xz|*.txz)
+      if ! tar -tJf "$archive" | legacyMembersAreSafe; then
+        printf 'Legacy tar archive contains an unsafe path.\n' >&2
+        exit 1
+      fi
+      if $dry_run; then
+        tar -tJf "$archive"
+      else
+        mkdir -p "$target"
+        tar -xJf "$archive" -C "$target"
+      fi
+      ;;
+    *.tar)
+      if ! tar -tf "$archive" | legacyMembersAreSafe; then
+        printf 'Legacy tar archive contains an unsafe path.\n' >&2
+        exit 1
+      fi
+      if $dry_run; then
+        tar -tf "$archive"
+      else
+        mkdir -p "$target"
+        tar -xf "$archive" -C "$target"
+      fi
+      ;;
+    *)
+      printf 'Unsupported legacy archive type: %s\n' "$archive" >&2
+      exit 2
+      ;;
+  esac
+
+  if ! $dry_run; then
+    printf '\nLegacy archive extracted at %s; live /data was not overwritten.\n' "$target"
+  fi
+}
+
+function doctorCommand(){
+  local available_kb=""
+  local failed=0
+  local required_kb=""
+
+  heading "GTNH diagnostics"
+  if [[ -d /data && -w /data ]]; then
+    printf '%s[OK]%s   /data is writable\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s[FAIL]%s /data is not writable\n' "$C_RED" "$C_RESET"
+    failed=1
+  fi
+  if [[ -d /backups && -w /backups ]]; then
+    printf '%s[OK]%s   /backups is writable\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s[FAIL]%s /backups is not writable\n' "$C_RED" "$C_RESET"
+    failed=1
+  fi
+  if [[ "$BACKUP_MIN_FREE_GB" =~ ^[1-9][0-9]*$ ]]; then
+    available_kb="$(df -Pk /backups | awk 'NR == 2 {print $4}')"
+    required_kb=$((BACKUP_MIN_FREE_GB * 1024 * 1024))
+    if [[ "$available_kb" =~ ^[0-9]+$ ]] && (( available_kb >= required_kb )); then
+      printf '%s[OK]%s   Backup disk has at least %s GiB free\n' "$C_GREEN" "$C_RESET" "$BACKUP_MIN_FREE_GB"
+    else
+      printf '%s[FAIL]%s Backup disk has less than %s GiB free\n' "$C_RED" "$C_RESET" "$BACKUP_MIN_FREE_GB"
+      failed=1
+    fi
+  else
+    printf '%s[FAIL]%s GTNH_BACKUP_MIN_FREE_GB is invalid\n' "$C_RED" "$C_RESET"
+    failed=1
+  fi
+  if [[ -s "$GTNH_RESTIC_PASSWORD_FILE" ]]; then
+    printf '%s[OK]%s   Restic password file is present\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s[FAIL]%s Restic password file is missing\n' "$C_RED" "$C_RESET"
+    failed=1
+  fi
+  gtnhResticEnvironment
+  if restic cat config >/dev/null 2>&1; then
+    printf '%s[OK]%s   Restic repository opens successfully\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s[WARN]%s Restic repository has not been initialized\n' "$C_YELLOW" "$C_RESET"
+  fi
+  if [[ ! -e "$STATE_FILE" ]] || jq -e . "$STATE_FILE" >/dev/null 2>&1; then
+    printf '%s[OK]%s   Manager state is valid\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s[FAIL]%s Manager state is invalid JSON\n' "$C_RED" "$C_RESET"
+    failed=1
+  fi
+  return "$failed"
+}
+
+function backupCommand(){
+  local current=""
+  local rcon_env="/data/.rcon-cli.env"
+  local save_disabled=false
+
+  current="$(currentVersion)"
+  if [[ ! -s "$rcon_env" ]]; then
+    printf 'RCON environment is unavailable: %s\n' "$rcon_env" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  . "$rcon_env"
+  trap 'if $save_disabled; then rcon-cli save-on >/dev/null 2>&1 || true; fi' EXIT
+
+  heading "On-demand GTNH snapshot"
+  printf '[1/3] Pausing world saves and flushing Minecraft state.\n'
+  rcon-cli save-off >/dev/null
+  save_disabled=true
+  rcon-cli save-all flush >/dev/null
+  printf '[2/3] Creating incremental Restic snapshot.\n'
+  createGTNHresticSnapshot on-demand "$current" "$current"
+  printf '[3/3] Resuming world saves.\n'
+  rcon-cli save-on >/dev/null
+  save_disabled=false
+  trap - EXIT
+}
+
+function usage(){
+  cat <<'EOF'
+Usage: gtnhctl <command>
+
+Commands:
+  status              Show current build, update, backup, cache, and disk status
+  watch [seconds]     Refresh status continuously (default: 2 seconds)
+  snapshots [args]    List Restic snapshots
+  backup              Create an RCON-coordinated incremental snapshot now
+  check [args]        Check Restic repository metadata or pass --read-data-subset
+  restore SNAPSHOT    Stage and verify a snapshot restore without overwriting /data
+  legacy-restore FILE Inspect or stage one explicitly named old tar/ZIP backup
+  cache [list]        List persistent verified GTNH artifacts
+  cache prune [keep]  Retain only the most recently used verified artifacts
+  logs [lines] [-f]   Show or follow persisted update-manager events
+  doctor              Validate mounts, credentials, repository, and manager state
+  help                Show this help
+EOF
+}
+
+command_name="${1:-status}"
+shift || true
+case "$command_name" in
+  status) statusCommand ;;
+  watch)
+    interval="${1:-2}"
+    while true; do
+      clear
+      statusCommand
+      sleep "$interval"
+    done
+    ;;
+  snapshots) snapshotsCommand "$@" ;;
+  backup) backupCommand ;;
+  check) checkCommand "$@" ;;
+  restore) restoreCommand "$@" ;;
+  legacy-restore) legacyRestoreCommand "$@" ;;
+  cache) cacheCommand "$@" ;;
+  logs) logsCommand "$@" ;;
+  doctor) doctorCommand ;;
+  help|-h|--help) usage ;;
+  *)
+    printf 'Unknown command: %s\n\n' "$command_name" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

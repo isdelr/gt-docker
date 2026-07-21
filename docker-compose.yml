@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
       args:
         MC_IMAGE_TAG: ${MC_IMAGE_TAG:-2026.5.3-java25}
+        MC_BACKUP_IMAGE_TAG: ${MC_BACKUP_IMAGE_TAG:-2026.7.1}
     image: ${GTNH_IMAGE_NAME:-gtnh-minecraft-server}:${MC_IMAGE_TAG:-2026.5.3-java25}
     container_name: ${CONTAINER_NAME:-gtnh}
     restart: on-failure:3
@@ -23,17 +24,9 @@ services:
       JVM_OPTS: ${JVM_OPTS:-}
       JVM_DD_OPTS: ${JVM_DD_OPTS:-}
       AUTO_CONFIRM_FORGE_QUERIES: ${AUTO_CONFIRM_FORGE_QUERIES:-false}
-      AUTO_RESTORE_ON_CORRUPT_LEVELDAT: ${AUTO_RESTORE_ON_CORRUPT_LEVELDAT:-false}
-      AUTO_RESTORE_ON_FML_LEVELDAT_WARNING: ${AUTO_RESTORE_ON_FML_LEVELDAT_WARNING:-false}
-      AUTO_RESTORE_BACKUP_DIRS: ${AUTO_RESTORE_BACKUP_DIRS:-/backups /data/backups}
-      AUTO_RESTORE_BACKUP_MAX_DEPTH: ${AUTO_RESTORE_BACKUP_MAX_DEPTH:-4}
-      CORRUPTION_GUARD_ENABLED: ${CORRUPTION_GUARD_ENABLED:-true}
-      CORRUPTION_GUARD_CLEAR: ${CORRUPTION_GUARD_CLEAR:-false}
-      GTNH_DISABLE_OPTIMIZED_CHUNK_COMPRESSION: ${GTNH_DISABLE_OPTIMIZED_CHUNK_COMPRESSION:-true}
-      GTNH_CHUNK_SAVE_DEBUG: ${GTNH_CHUNK_SAVE_DEBUG:-true}
       GTNH_INTERNAL_BACKUP_TIMER: ${GTNH_INTERNAL_BACKUP_TIMER:-0.5}
-      GTNH_INTERNAL_BACKUPS_TO_KEEP: ${GTNH_INTERNAL_BACKUPS_TO_KEEP:-48}
-      GTNH_INTERNAL_BACKUP_MAX_GB: ${GTNH_INTERNAL_BACKUP_MAX_GB:-35}
+      GTNH_INTERNAL_BACKUPS_TO_KEEP: ${GTNH_INTERNAL_BACKUPS_TO_KEEP:-24}
+      GTNH_INTERNAL_BACKUP_MAX_GB: ${GTNH_INTERNAL_BACKUP_MAX_GB:-20}
       GTNH_INTERNAL_BACKUP_COMPRESSION: ${GTNH_INTERNAL_BACKUP_COMPRESSION:-4}
       GTNH_INTERNAL_BACKUP_CLAIMED_ONLY: ${GTNH_INTERNAL_BACKUP_CLAIMED_ONLY:-true}
       GTNH_INTERNAL_BACKUP_WHOLE_REGIONS: ${GTNH_INTERNAL_BACKUP_WHOLE_REGIONS:-true}
@@ -42,10 +35,19 @@ services:
       GTNH_PACK_SHA256: ${GTNH_PACK_SHA256:-}
       GTNH_GITHUB_TOKEN: ${GTNH_GITHUB_TOKEN:-}
       GTNH_PRE_UPDATE_BACKUP: ${GTNH_PRE_UPDATE_BACKUP:-true}
-      GTNH_PRE_UPDATE_BACKUP_THREADS: ${GTNH_PRE_UPDATE_BACKUP_THREADS:-0}
-      GTNH_PRE_UPDATE_BACKUP_PROGRESS_SECONDS: ${GTNH_PRE_UPDATE_BACKUP_PROGRESS_SECONDS:-30}
+      GTNH_RESTIC_REPOSITORY: ${GTNH_RESTIC_REPOSITORY:-/backups/restic}
+      GTNH_RESTIC_PASSWORD: ${GTNH_RESTIC_PASSWORD:-}
+      GTNH_RESTIC_PASSWORD_FILE: /backups/.gtnh-restic-password
+      GTNH_RESTIC_HOSTNAME: ${GTNH_RESTIC_HOSTNAME:-gtnh}
+      GTNH_RESTIC_RETRY_LOCK: ${GTNH_RESTIC_RETRY_LOCK:-5m}
+      GTNH_RESTIC_READ_CONCURRENCY: ${GTNH_RESTIC_READ_CONCURRENCY:-4}
+      GTNH_RESTIC_PROGRESS_SECONDS: ${GTNH_RESTIC_PROGRESS_SECONDS:-10}
+      GTNH_RESTIC_COMPRESSION: ${GTNH_RESTIC_COMPRESSION:-auto}
+      GTNH_PRE_UPDATE_SNAPSHOTS_KEEP: ${GTNH_PRE_UPDATE_SNAPSHOTS_KEEP:-2}
+      GTNH_ARTIFACT_CACHE_KEEP: ${GTNH_ARTIFACT_CACHE_KEEP:-2}
+      GTNH_TRANSACTION_BACKUPS_KEEP: ${GTNH_TRANSACTION_BACKUPS_KEEP:-2}
+      GTNH_BACKUP_MIN_FREE_GB: ${GTNH_BACKUP_MIN_FREE_GB:-20}
       SKIP_GTNH_UPDATE_CHECK: ${SKIP_GTNH_UPDATE_CHECK:-false}
-      GTNH_DELETE_BACKUPS: ${GTNH_DELETE_BACKUPS:-false}
       SERVER_PORT: ${SERVER_PORT:-25565}
       MAX_PLAYERS: ${MAX_PLAYERS:-10}
       MOTD: ${MOTD:-GregTech New Horizons}
@@ -82,6 +84,7 @@ services:
   gtnh-backups:
     image: itzg/mc-backup:${MC_BACKUP_IMAGE_TAG:-2026.7.1}
     container_name: ${BACKUP_CONTAINER_NAME:-gtnh-backups}
+    user: "${MC_UID:-1000}:${MC_GID:-1000}"
     restart: on-failure:5
     depends_on:
       gtnh:
@@ -92,22 +95,34 @@ services:
       BACKUP_INTERVAL: ${BACKUP_INTERVAL:-12h}
       INITIAL_DELAY: ${BACKUP_INITIAL_DELAY:-0}
       BACKUP_ON_STARTUP: "true"
-      BACKUP_METHOD: tar
-      TAR_COMPRESS_METHOD: gzip
-      TAR_COMPRESS_PARAMETERS: "-1"
-      PRUNE_BACKUPS_DAYS: ${PRUNE_BACKUPS_DAYS:-7}
-      PRUNE_BACKUPS_COUNT: ${PRUNE_BACKUPS_COUNT:-14}
-      EXCLUDES: ${BACKUP_EXCLUDES:-*.jar,cache,logs,*.tmp,backups,.gtnh-recovery,gtnh-upgrade-*,World-*.zip,packs}
+      BACKUP_METHOD: restic
+      ENABLE_SYNC: "false"
+      RESTIC_REPOSITORY: ${GTNH_RESTIC_REPOSITORY:-/backups/restic}
+      RESTIC_PASSWORD_FILE: /backups/.gtnh-restic-password
+      RESTIC_CACHE_DIR: /tmp/restic-cache
+      RESTIC_HOSTNAME: ${GTNH_RESTIC_HOSTNAME:-gtnh}
+      RESTIC_ADDITIONAL_TAGS: scheduled
+      RESTIC_RETRY_LOCK: ${GTNH_RESTIC_RETRY_LOCK:-5m}
+      GTNH_BACKUP_MIN_FREE_GB: ${GTNH_BACKUP_MIN_FREE_GB:-20}
+      PRUNE_RESTIC_RETENTION: ${PRUNE_RESTIC_RETENTION:---keep-within 24h --keep-daily 7 --keep-weekly 4 --keep-monthly 3}
+      EXCLUDES: ${BACKUP_EXCLUDES:-*.jar,cache,logs,*.tmp,backups,.gtnh-manager,.gtnh-recovery,gtnh-upgrade-*,World-*.zip,packs}
       RCON_RETRIES: "30"
       RCON_RETRY_INTERVAL: 10s
       RCON_HOST: gtnh
       RCON_PORT: ${RCON_PORT:-25575}
+      PRE_BACKUP_SCRIPT: |
+        min_gb="$${GTNH_BACKUP_MIN_FREE_GB:-20}"
+        available_kb="$$(df -Pk /backups | awk 'NR == 2 {print $$4}')"
+        required_kb="$$(( min_gb * 1024 * 1024 ))"
+        if [ "$$available_kb" -lt "$$required_kb" ]; then
+          echo "Refusing backup: less than $${min_gb} GiB remains free on /backups." >&2
+          exit 1
+        fi
       POST_BACKUP_SCRIPT: |
         [ "$$1" -eq 0 ] || exit "$$1"
-        latest="$$(find /backups -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tgz' \) -print | sort | tail -n 1)"
+        latest="$$(restic snapshots --host "$${RESTIC_HOSTNAME}" --tag "$${BACKUP_NAME},scheduled" --latest 1 --json | jq -r '.[0].id // empty')"
         test -n "$$latest"
-        test -s "$$latest"
-        gzip -t "$$latest"
+        printf '%s\n' "$$latest" > /backups/.last-restic-snapshot
         date -u +%s > /backups/.last-verified
     volumes:
       - gtnh-data:/data:ro

@@ -22,6 +22,13 @@ function resetData(){
   mkdir -p /data
 }
 
+function resetBackups(){
+  mkdir -p /backups
+  find /backups -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  printf 'test-restic-password\n' > /backups/.gtnh-restic-password
+  chmod 600 /backups/.gtnh-restic-password
+}
+
 function makeValidPack(){
   local pack="$1"
   mkdir -p "$pack/config" "$pack/mods" "$pack/libraries/example"
@@ -79,13 +86,77 @@ function testInstalledPinnedDailyNeedsNoArtifact(){
   exactDailyGTNHisAlreadyInstalled
 }
 
+function testArtifactCacheAndResume(){
+  local fixture_root="/tmp/gtnh-cache-test"
+  local fixture_archive="$fixture_root/server.zip"
+  local download_count_file="$fixture_root/download-count"
+  local expected_staging=""
+
+  resetData
+  rm -rf "$fixture_root"
+  mkdir -p "$fixture_root/pack"
+  makeValidPack "$fixture_root/pack"
+  python3 -c 'import shutil, sys; shutil.make_archive(sys.argv[1], "zip", sys.argv[2])' \
+    "${fixture_archive%.zip}" "$fixture_root/pack"
+  printf '0\n' > "$download_count_file"
+  printf 'GT_New_Horizons_2.9.0-beta-2_Server_Java_17-25.zip\n' > /data/.gtnh-version
+
+  GTNH_MIN_CONFIG_FILES=2
+  GTNH_MIN_LIBRARY_JARS=2
+  GTNH_MIN_MOD_JARS=2
+  current_java_version=25
+  gtnh_selected_id="GTNH-daily-cache-test-server-java17-25.zip"
+  gtnh_download_path="https://api.github.test/cache-test.zip"
+  gtnh_download_kind="github-actions"
+  gtnh_download_sha256="$(sha256sum "$fixture_archive" | awk '{print $1}')"
+  gtnh_download_size="$(stat -c '%s' "$fixture_archive")"
+
+  function githubApiCurl(){
+    local output=""
+    while (( $# > 0 )); do
+      if [[ "$1" == "-o" ]]; then
+        output="$2"
+        shift 2
+      else
+        shift
+      fi
+    done
+    printf '%s\n' "$(( $(cat "$download_count_file") + 1 ))" > "$download_count_file"
+    cp "$fixture_archive" "$output"
+  }
+
+  initializeGTNHmanagerOperation
+  expected_staging="${GTNH_MANAGER_DIR}/staging/${gtnh_manager_operation_id}"
+  downloadGTNH
+  [[ "$(cat "$download_count_file")" == "1" ]]
+  [[ -s "$gtnh_manager_artifact_path" ]]
+  [[ "$(jq -r '.stage' "$GTNH_MANAGER_STATE_FILE")" == "staged" ]]
+  [[ -s "$expected_staging/validated.json" ]]
+
+  jq '.staging_path = "/data"' "$GTNH_MANAGER_STATE_FILE" > "$GTNH_MANAGER_STATE_FILE.tmp"
+  mv -f "$GTNH_MANAGER_STATE_FILE.tmp" "$GTNH_MANAGER_STATE_FILE"
+  gtnh_manager_operation_id=""
+  gtnh_manager_staging_path=""
+  initializeGTNHmanagerOperation
+  [[ "$gtnh_manager_staging_path" == "$expected_staging" ]]
+  downloadGTNH
+  [[ "$(cat "$download_count_file")" == "1" ]]
+
+  rm -rf "$expected_staging"
+  gtnh_manager_operation_id=""
+  initializeGTNHmanagerOperation
+  downloadGTNH
+  [[ "$(cat "$download_count_file")" == "1" ]]
+  [[ -s "$expected_staging/validated.json" ]]
+}
+
 function testTransactionalUpdate(){
   local stage="/tmp/gtnh-transaction/new-pack"
   local backup=""
-  local data_backup=""
+  local snapshot_id=""
   resetData
+  resetBackups
   rm -rf /tmp/gtnh-transaction
-  find /backups -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 
   mkdir -p /data/world /data/mods /data/libraries /data/config/JourneyMapServer /data/journeymap
   mkdir -p /data/serverutilities
@@ -101,7 +172,6 @@ function testTransactionalUpdate(){
   printf 'custom-icon\n' > /data/server-icon.png
   printf 'serverutilities-state\n' > /data/serverutilities/state.dat
   printf 'GT_New_Horizons_2.9.0-beta-2_Server_Java_17-25.zip\n' > /data/.gtnh-version
-  printf 'interrupted-backup\n' > /backups/.gtnh-pre-upgrade-stale.tmp.999
 
   makeValidPack "$stage"
   mkdir -p "$stage/config/JourneyMapServer" "$stage/journeymap"
@@ -111,6 +181,8 @@ function testTransactionalUpdate(){
 
   base_dir="$stage"
   gtnh_selected_id="GTNH-daily-2026-07-19+630-server-java17-25.zip"
+  gtnh_download_path="https://api.github.test/artifact.zip"
+  initializeGTNHmanagerOperation
   updateGTNH
 
   assertFileContains /data/world/level.dat world-data
@@ -125,24 +197,34 @@ function testTransactionalUpdate(){
   [[ -f /data/mods/a.jar && ! -e /data/mods/old.jar ]]
   [[ -f /data/journeymap/new.txt && ! -e /data/journeymap/old.txt ]]
   [[ ! -e "$GTNH_UPDATE_MARKER" ]]
-  [[ ! -e /backups/.gtnh-pre-upgrade-stale.tmp.999 ]]
 
   backup="$(find /data -maxdepth 1 -type d -name 'gtnh-upgrade-*' -print -quit)"
   [[ -n "$backup" ]]
   assertFileContains "$backup/mods/old.jar" old-mod
   assertFileContains "$backup/config/pack.cfg" old-config
 
-  data_backup="$(find /backups -maxdepth 1 -type f -name 'gtnh-pre-upgrade-*.tar.gz' -print -quit)"
-  [[ -n "$data_backup" ]]
-  gzip -t "$data_backup"
-  tar -tzf "$data_backup" > /tmp/gtnh-backup-contents.txt
-  grep -Fqx './world/level.dat' /tmp/gtnh-backup-contents.txt
-  grep -Fqx './serverutilities/state.dat' /tmp/gtnh-backup-contents.txt
-  if grep -Fqx './mods/old.jar' /tmp/gtnh-backup-contents.txt; then
+  snapshot_id="$gtnh_manager_snapshot_id"
+  [[ -n "$snapshot_id" ]]
+  restic ls "$snapshot_id" > /tmp/gtnh-backup-contents.txt
+  grep -Fq '/world/level.dat' /tmp/gtnh-backup-contents.txt
+  grep -Fq '/serverutilities/state.dat' /tmp/gtnh-backup-contents.txt
+  if grep -Fq '/mods/old.jar' /tmp/gtnh-backup-contents.txt; then
     echo "Pack-managed mods should not be duplicated in the data backup." >&2
     exit 1
   fi
+  [[ "$(restic dump "$snapshot_id" /world/level.dat)" == "world-data" ]]
   [[ -s /backups/.last-verified ]]
+  [[ "$(cat /backups/.last-restic-snapshot)" == "$snapshot_id" ]]
+  [[ "$(jq -r '.stage' "$GTNH_MANAGER_STATE_FILE")" == "applied" ]]
+
+  mkdir -p /data/gtnh-upgrade-retention-old-1 /data/gtnh-upgrade-retention-old-2
+  touch -d '2020-01-01T00:00:00Z' /data/gtnh-upgrade-retention-old-1
+  touch -d '2021-01-01T00:00:00Z' /data/gtnh-upgrade-retention-old-2
+  printf '%s\n' "$gtnh_selected_id" > /data/.gtnh-version
+  finalizeInstalledGTNHmanagerOperation
+  [[ "$(jq -r '.stage' "$GTNH_MANAGER_STATE_FILE")" == "complete" ]]
+  [[ ! -e "$gtnh_manager_staging_path" ]]
+  [[ "$(find /data -mindepth 1 -maxdepth 1 -type d -name 'gtnh-upgrade-*' | wc -l)" == "2" ]]
 }
 
 function testInterruptedRecovery(){
@@ -166,6 +248,7 @@ function testInterruptedRecovery(){
 testDailyResolver
 testArchiveValidation
 testInstalledPinnedDailyNeedsNoArtifact
+testArtifactCacheAndResume
 testTransactionalUpdate
 testInterruptedRecovery
 echo "GTNH deploy tests passed."

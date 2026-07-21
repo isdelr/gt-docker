@@ -2,6 +2,8 @@
 
 # shellcheck source=start-utils
 . "$(dirname "${BASH_SOURCE[0]}")/start-utils"
+# shellcheck source=gtnh-restic.sh
+. /usr/local/lib/gtnh-restic.sh
 
 # This is the upstream GTNH deploy flow with exact release and tested daily
 # artifact support plus transactional updates for persistent servers.
@@ -12,7 +14,19 @@ GTNH_DAILY_REPOSITORY="${GTNH_DAILY_REPOSITORY:-GTNewHorizons/DreamAssemblerXXL}
 GTNH_DAILY_WORKFLOW="${GTNH_DAILY_WORKFLOW:-daily-modpack-build.yml}"
 GTNH_GITHUB_API="${GTNH_GITHUB_API:-https://api.github.com}"
 GTNH_UPDATE_MARKER="/data/.gtnh-update-in-progress"
-gtnh_pre_update_backup_temp=""
+GTNH_MANAGER_STATE_FILE="${GTNH_MANAGER_STATE_FILE:-/data/.gtnh-manager/state.json}"
+GTNH_ARTIFACT_CACHE_DIR="${GTNH_ARTIFACT_CACHE_DIR:-/data/packs/artifacts}"
+GTNH_ARTIFACT_CACHE_KEEP="${GTNH_ARTIFACT_CACHE_KEEP:-2}"
+GTNH_TRANSACTION_BACKUPS_KEEP="${GTNH_TRANSACTION_BACKUPS_KEEP:-2}"
+GTNH_BACKUP_MIN_FREE_GB="${GTNH_BACKUP_MIN_FREE_GB:-20}"
+gtnh_manager_operation_id=""
+gtnh_manager_source=""
+gtnh_manager_stage=""
+gtnh_manager_snapshot_id=""
+gtnh_manager_target=""
+gtnh_manager_artifact_digest=""
+gtnh_manager_artifact_path=""
+gtnh_manager_staging_path=""
 
 function setGTNHdownloadPath(){
   gtnh_download_path="$1"
@@ -303,11 +317,24 @@ function getGTNHdownloadPath(){
   fi
 }
 
-function deleteGTNHbackup(){
-  log "Start deleting all GTNH transaction backups"
-  if ! find /data -maxdepth 1 -type d -name 'gtnh-upgrade-*' -exec rm -rf {} + ; then
-    logWarning "Can not delete config backup!"
+function pruneGTNHtransactionBackups(){
+  local backup_folder=""
+  local backup_count=0
+
+  if [[ ! "$GTNH_TRANSACTION_BACKUPS_KEEP" =~ ^[1-9][0-9]*$ ]]; then
+    logWarning "GTNH_TRANSACTION_BACKUPS_KEEP must be a positive integer; rollback pruning was skipped."
+    return 0
   fi
+  while IFS= read -r backup_folder; do
+    backup_count=$((backup_count + 1))
+    if (( backup_count > GTNH_TRANSACTION_BACKUPS_KEEP )); then
+      case "$backup_folder" in
+        /data/gtnh-upgrade-*) rm -rf -- "$backup_folder" ;;
+        *) logWarning "Refusing to prune an invalid GTNH rollback path: $backup_folder" ;;
+      esac
+    fi
+  done < <(find /data -mindepth 1 -maxdepth 1 -type d -name 'gtnh-upgrade-*' -printf '%T@|%p\n' \
+    | sort -t '|' -k 1,1nr | cut -d '|' -f 2-)
 }
 
 function gtnhManagedResources(){
@@ -325,6 +352,165 @@ function safeGTNHbuildId(){
 
 function selectedGTNHversionMarker(){
   printf '%s\n' "${gtnh_selected_id:-$(basename "$gtnh_download_path")}"
+}
+
+function gtnhManagerLog(){
+  log "[gtnh-manager] $*"
+  appendGTNHmanagerEvent INFO "$*"
+}
+
+function currentGTNHversionMarker(){
+  if [[ -s /data/.gtnh-version ]]; then
+    head -n 1 /data/.gtnh-version
+  else
+    printf 'not-installed\n'
+  fi
+}
+
+function writeGTNHmanagerState(){
+  local stage="$1"
+  local started_at=""
+  local state_tmp="${GTNH_MANAGER_STATE_FILE}.tmp.$$"
+  local updated_at=""
+
+  mkdir -p "$(dirname "$GTNH_MANAGER_STATE_FILE")"
+  updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  started_at="$updated_at"
+  if [[ -s "$GTNH_MANAGER_STATE_FILE" ]] && jq -e . "$GTNH_MANAGER_STATE_FILE" >/dev/null 2>&1; then
+    started_at="$(jq -r '.started_at // empty' "$GTNH_MANAGER_STATE_FILE")"
+    [[ -n "$started_at" ]] || started_at="$updated_at"
+  fi
+
+  jq -n \
+    --arg operation_id "$gtnh_manager_operation_id" \
+    --arg source "$gtnh_manager_source" \
+    --arg target "$gtnh_manager_target" \
+    --arg stage "$stage" \
+    --arg snapshot_id "$gtnh_manager_snapshot_id" \
+    --arg artifact_digest "$gtnh_manager_artifact_digest" \
+    --arg artifact_path "$gtnh_manager_artifact_path" \
+    --arg staging_path "$gtnh_manager_staging_path" \
+    --arg started_at "$started_at" \
+    --arg updated_at "$updated_at" \
+    '{schema: 1, operation_id: $operation_id, source: $source, target: $target, stage: $stage,
+      snapshot_id: $snapshot_id, artifact_digest: $artifact_digest,
+      artifact_path: $artifact_path, staging_path: $staging_path,
+      started_at: $started_at, updated_at: $updated_at}' > "$state_tmp" \
+    && mv -f "$state_tmp" "$GTNH_MANAGER_STATE_FILE"
+  gtnh_manager_stage="$stage"
+}
+
+function initializeGTNHmanagerOperation(){
+  local existing_operation=""
+  local existing_source=""
+  local existing_target=""
+  local operation_input=""
+
+  gtnh_manager_source="$(currentGTNHversionMarker)"
+  gtnh_manager_target="$(selectedGTNHversionMarker)"
+  operation_input="${gtnh_manager_source}|${gtnh_manager_target}"
+  gtnh_manager_operation_id="$(printf '%s' "$operation_input" | sha256sum | cut -c 1-16)"
+  gtnh_manager_staging_path="${GTNH_MANAGER_DIR}/staging/${gtnh_manager_operation_id}"
+  mkdir -p "$GTNH_ARTIFACT_CACHE_DIR" "${GTNH_MANAGER_DIR}/staging"
+
+  if [[ -s "$GTNH_MANAGER_STATE_FILE" ]] && jq -e . "$GTNH_MANAGER_STATE_FILE" >/dev/null 2>&1; then
+    existing_operation="$(jq -r '.operation_id // empty' "$GTNH_MANAGER_STATE_FILE")"
+    existing_source="$(jq -r '.source // empty' "$GTNH_MANAGER_STATE_FILE")"
+    existing_target="$(jq -r '.target // empty' "$GTNH_MANAGER_STATE_FILE")"
+    if [[ "$existing_operation" == "$gtnh_manager_operation_id" &&
+          "$existing_source" == "$gtnh_manager_source" &&
+          "$existing_target" == "$gtnh_manager_target" ]]; then
+      gtnh_manager_stage="$(jq -r '.stage // "resolved"' "$GTNH_MANAGER_STATE_FILE")"
+      gtnh_manager_snapshot_id="$(jq -r '.snapshot_id // empty' "$GTNH_MANAGER_STATE_FILE")"
+      gtnh_manager_artifact_digest="$(jq -r '.artifact_digest // empty' "$GTNH_MANAGER_STATE_FILE")"
+      gtnh_manager_artifact_path="$(jq -r '.artifact_path // empty' "$GTNH_MANAGER_STATE_FILE")"
+      gtnh_manager_staging_path="$(jq -r '.staging_path // empty' "$GTNH_MANAGER_STATE_FILE")"
+      if [[ "$gtnh_manager_staging_path" != "${GTNH_MANAGER_DIR}/staging/${gtnh_manager_operation_id}" ]]; then
+        logWarning "Ignoring an invalid staging path in the GTNH manager journal."
+        gtnh_manager_staging_path="${GTNH_MANAGER_DIR}/staging/${gtnh_manager_operation_id}"
+      fi
+      gtnhManagerLog "Resuming operation $gtnh_manager_operation_id at stage '$gtnh_manager_stage'."
+      return 0
+    fi
+  fi
+
+  gtnh_manager_stage="resolved"
+  gtnh_manager_snapshot_id=""
+  gtnh_manager_artifact_digest=""
+  gtnh_manager_artifact_path=""
+  writeGTNHmanagerState resolved
+  gtnhManagerLog "Started operation $gtnh_manager_operation_id: $gtnh_manager_source -> $gtnh_manager_target."
+}
+
+function pruneGTNHartifactCache(){
+  local artifact=""
+  local artifact_count=0
+  local digest=""
+  local index_file=""
+
+  if [[ ! "$GTNH_ARTIFACT_CACHE_KEEP" =~ ^[1-9][0-9]*$ ]]; then
+    logWarning "GTNH_ARTIFACT_CACHE_KEEP must be a positive integer; cache pruning was skipped."
+    return 0
+  fi
+  [[ -d "$GTNH_ARTIFACT_CACHE_DIR" ]] || return 0
+
+  while IFS= read -r artifact; do
+    artifact_count=$((artifact_count + 1))
+    if (( artifact_count > GTNH_ARTIFACT_CACHE_KEEP )); then
+      rm -f "$artifact"
+    fi
+  done < <(find "$GTNH_ARTIFACT_CACHE_DIR" -maxdepth 1 -type f -name '*.zip' -printf '%T@|%p\n' \
+    | sort -t '|' -k 1,1nr | cut -d '|' -f 2-)
+
+  find "$GTNH_ARTIFACT_CACHE_DIR" -maxdepth 1 -type f -name '.*.part' -mtime +7 -delete
+  if [[ -d "$GTNH_ARTIFACT_CACHE_DIR/index" ]]; then
+    while IFS= read -r index_file; do
+      digest="$(jq -r '.digest // empty' "$index_file" 2>/dev/null || true)"
+      if [[ -z "$digest" || ! -s "$GTNH_ARTIFACT_CACHE_DIR/${digest}.zip" ]]; then
+        rm -f "$index_file"
+      fi
+    done < <(find "$GTNH_ARTIFACT_CACHE_DIR/index" -maxdepth 1 -type f -name '*.json')
+  fi
+}
+
+function completeGTNHmanagerOperation(){
+  writeGTNHmanagerState complete
+  if [[ "$gtnh_manager_staging_path" == "${GTNH_MANAGER_DIR}/staging/"* ]]; then
+    rm -rf "$gtnh_manager_staging_path"
+  fi
+  pruneGTNHartifactCache
+  pruneGTNHtransactionBackups
+  if isTrue "${GTNH_PRE_UPDATE_BACKUP:-true}" && ! forgetOldGTNHpreUpdateSnapshots; then
+    logWarning "The update completed, but old pre-upgrade snapshot retention could not be applied."
+  fi
+  gtnhManagerLog "Operation $gtnh_manager_operation_id completed."
+}
+
+function finalizeInstalledGTNHmanagerOperation(){
+  local installed_target=""
+  local state_target=""
+  local state_stage=""
+
+  [[ -s "$GTNH_MANAGER_STATE_FILE" ]] && jq -e . "$GTNH_MANAGER_STATE_FILE" >/dev/null 2>&1 || return 0
+  installed_target="$(currentGTNHversionMarker)"
+  state_target="$(jq -r '.target // empty' "$GTNH_MANAGER_STATE_FILE")"
+  state_stage="$(jq -r '.stage // empty' "$GTNH_MANAGER_STATE_FILE")"
+  if [[ "$installed_target" != "$state_target" || "$state_stage" == "complete" ]]; then
+    return 0
+  fi
+
+  gtnh_manager_operation_id="$(jq -r '.operation_id // empty' "$GTNH_MANAGER_STATE_FILE")"
+  gtnh_manager_source="$(jq -r '.source // empty' "$GTNH_MANAGER_STATE_FILE")"
+  gtnh_manager_target="$state_target"
+  gtnh_manager_snapshot_id="$(jq -r '.snapshot_id // empty' "$GTNH_MANAGER_STATE_FILE")"
+  gtnh_manager_artifact_digest="$(jq -r '.artifact_digest // empty' "$GTNH_MANAGER_STATE_FILE")"
+  gtnh_manager_artifact_path="$(jq -r '.artifact_path // empty' "$GTNH_MANAGER_STATE_FILE")"
+  gtnh_manager_staging_path="$(jq -r '.staging_path // empty' "$GTNH_MANAGER_STATE_FILE")"
+  if [[ "$gtnh_manager_staging_path" != "${GTNH_MANAGER_DIR}/staging/${gtnh_manager_operation_id}" ]]; then
+    gtnh_manager_staging_path="${GTNH_MANAGER_DIR}/staging/${gtnh_manager_operation_id}"
+  fi
+  gtnhManagerLog "Finalizing the completed update journal after restart."
+  completeGTNHmanagerOperation
 }
 
 function writeGTNHversionMarker(){
@@ -376,55 +562,138 @@ function validateGTNHarchive(){
   log "Validated complete GTNH server archive ($mod_count mods, $library_count libraries, $config_count config files)."
 }
 
+function validateGTNHcachedArtifact(){
+  local artifact="$1"
+  local expected_digest="$2"
+  local expected_size="$3"
+  local actual_digest=""
+  local actual_size=""
+
+  [[ -s "$artifact" ]] || return 1
+  actual_size="$(stat -c '%s' "$artifact")"
+  if [[ -n "$expected_size" && "$actual_size" != "$expected_size" ]]; then
+    return 1
+  fi
+  actual_digest="$(sha256sum "$artifact" | awk '{print $1}')"
+  if [[ -n "$expected_digest" && "${actual_digest,,}" != "${expected_digest,,}" ]]; then
+    return 1
+  fi
+  gtnh_manager_artifact_digest="${actual_digest,,}"
+  gtnh_manager_artifact_path="$artifact"
+}
+
 function downloadGTNH(){
   local actual_sha256=""
   local actual_size=""
+  local artifact_index=""
+  local artifact_key=""
+  local artifact_part=""
+  local cache_hit=false
+  local expected_sha256="${gtnh_download_sha256,,}"
   local gtnh_download=""
-  local packs_dir="/data/.tmp/packs"
+  local index_digest=""
+  local index_dir="${GTNH_ARTIFACT_CACHE_DIR}/index"
+  local stage_marker=""
+  local staged_base=""
+  local staged_relative=""
 
-  original_base_dir="/data/.tmp/gtnh_base"
-  base_dir="$original_base_dir"
-  rm -rf "$original_base_dir" "$packs_dir"
-  mkdir -p "$original_base_dir" "$packs_dir"
+  [[ -n "$gtnh_manager_operation_id" ]] || initializeGTNHmanagerOperation
+  mkdir -p "$GTNH_ARTIFACT_CACHE_DIR" "$index_dir" "$gtnh_manager_staging_path"
+  artifact_key="$(printf '%s' "$gtnh_selected_id" | sha256sum | cut -c 1-24)"
+  artifact_index="$index_dir/${artifact_key}.json"
+  artifact_part="$GTNH_ARTIFACT_CACHE_DIR/.${artifact_key}.part"
 
-  if [[ "$gtnh_download_kind" == "github-actions" ]]; then
-    gtnh_download="$packs_dir/$gtnh_selected_id"
-    log "Downloading authenticated GTNH daily artifact $gtnh_selected_id."
-    if ! githubApiCurl -o "$gtnh_download" "$gtnh_download_path"; then
-      logError "Failed to download GTNH daily artifact. Check token permissions and artifact expiry."
-      return 1
-    fi
-  else
-    log "Downloading $gtnh_download_path."
-    if ! gtnh_download=$(mc-image-helper get -o "$packs_dir" --output-filename --skip-up-to-date "$gtnh_download_path"); then
-      logError "Failed to download $gtnh_download_path"
-      return 1
-    fi
+  if [[ -n "$expected_sha256" ]]; then
+    gtnh_download="$GTNH_ARTIFACT_CACHE_DIR/${expected_sha256}.zip"
+  elif [[ -s "$artifact_index" ]] && jq -e . "$artifact_index" >/dev/null 2>&1; then
+    index_digest="$(jq -r '.digest // empty' "$artifact_index")"
+    [[ -n "$index_digest" ]] && gtnh_download="$GTNH_ARTIFACT_CACHE_DIR/${index_digest}.zip"
   fi
 
-  if [[ -n "$gtnh_download_size" ]]; then
-    actual_size="$(stat -c '%s' "$gtnh_download")"
-    if [[ "$actual_size" != "$gtnh_download_size" ]]; then
+  if [[ -n "$gtnh_download" ]] && validateGTNHcachedArtifact "$gtnh_download" "${expected_sha256:-$index_digest}" "$gtnh_download_size"; then
+    cache_hit=true
+    touch "$gtnh_download"
+    gtnhManagerLog "[2/5] Artifact cache hit: $(basename "$gtnh_download") ($(stat -c '%s' "$gtnh_download") bytes)."
+  fi
+
+  if isFalse "$cache_hit"; then
+    [[ -z "$gtnh_download" ]] || rm -f "$gtnh_download"
+    gtnhManagerLog "[2/5] Downloading artifact into the persistent cache."
+    if [[ "$gtnh_download_kind" == "github-actions" ]]; then
+      if ! githubApiCurl --retry 3 --retry-all-errors --continue-at - -o "$artifact_part" "$gtnh_download_path"; then
+        rm -f "$artifact_part"
+        if ! githubApiCurl --retry 3 --retry-all-errors -o "$artifact_part" "$gtnh_download_path"; then
+          logError "Failed to download GTNH daily artifact. Check token permissions and artifact expiry."
+          return 1
+        fi
+      fi
+    else
+      if ! curl -fsSL --retry 3 --retry-all-errors --continue-at - -o "$artifact_part" "$gtnh_download_path"; then
+        rm -f "$artifact_part"
+        if ! curl -fsSL --retry 3 --retry-all-errors -o "$artifact_part" "$gtnh_download_path"; then
+          logError "Failed to download $gtnh_download_path"
+          return 1
+        fi
+      fi
+    fi
+
+    actual_size="$(stat -c '%s' "$artifact_part")"
+    if [[ -n "$gtnh_download_size" && "$actual_size" != "$gtnh_download_size" ]]; then
+      rm -f "$artifact_part"
       logError "GTNH archive size verification failed: expected $gtnh_download_size bytes, got $actual_size."
       return 1
     fi
-  fi
-
-  if [[ -n "$gtnh_download_sha256" ]]; then
-    actual_sha256="$(sha256sum "$gtnh_download" | awk '{print $1}')"
-    if [[ "${actual_sha256,,}" != "${gtnh_download_sha256,,}" ]]; then
+    actual_sha256="$(sha256sum "$artifact_part" | awk '{print $1}')"
+    if [[ -n "$expected_sha256" && "${actual_sha256,,}" != "$expected_sha256" ]]; then
+      rm -f "$artifact_part"
       logError "GTNH archive digest verification failed."
       return 1
     fi
-    log "Verified GTNH archive SHA-256 digest."
+    gtnh_download="$GTNH_ARTIFACT_CACHE_DIR/${actual_sha256,,}.zip"
+    if [[ -s "$gtnh_download" ]]; then
+      rm -f "$artifact_part"
+    else
+      mv -f "$artifact_part" "$gtnh_download"
+    fi
+    gtnh_manager_artifact_digest="${actual_sha256,,}"
+    gtnh_manager_artifact_path="$gtnh_download"
+    touch "$gtnh_download"
+    jq -n \
+      --arg selected_id "$gtnh_selected_id" \
+      --arg digest "$gtnh_manager_artifact_digest" \
+      --argjson size "$actual_size" \
+      --arg source_url "$gtnh_download_path" \
+      --arg verified_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{selected_id: $selected_id, digest: $digest, size: $size, source_url: $source_url, verified_at: $verified_at}' \
+      > "${artifact_index}.tmp.$$" \
+      && mv -f "${artifact_index}.tmp.$$" "$artifact_index"
+    gtnhManagerLog "Verified and cached artifact $gtnh_manager_artifact_digest."
   fi
 
-  log "Unpacking GTNH server files into staging."
+  gtnh_download_sha256="$gtnh_manager_artifact_digest"
+  writeGTNHmanagerState artifact-verified
+  original_base_dir="$gtnh_manager_staging_path/extracted"
+  base_dir="$original_base_dir"
+  stage_marker="$gtnh_manager_staging_path/validated.json"
+  if [[ -s "$stage_marker" ]] && jq -e . "$stage_marker" >/dev/null 2>&1 &&
+     [[ "$(jq -r '.artifact_digest // empty' "$stage_marker")" == "$gtnh_manager_artifact_digest" ]]; then
+    staged_relative="$(jq -r '.base_relative // empty' "$stage_marker")"
+    staged_base="$original_base_dir${staged_relative:+/$staged_relative}"
+    if [[ -n "$staged_relative" || "$staged_base" == "$original_base_dir" ]] && validateGTNHarchive "$staged_base"; then
+      base_dir="$staged_base"
+      writeGTNHmanagerState staged
+      gtnhManagerLog "[3/5] Reusing validated extracted staging."
+      return 0
+    fi
+  fi
+
+  rm -rf "$original_base_dir"
+  mkdir -p "$original_base_dir"
+  gtnhManagerLog "[3/5] Extracting cached artifact into persistent staging."
   if ! extract "$gtnh_download" "$original_base_dir"; then
     logError "Failed to extract GTNH server files."
     return 1
   fi
-  rm -f "$gtnh_download"
   rm -f "$original_base_dir/eula.txt"
 
   if ! base_dir=$(mc-image-helper find \
@@ -435,7 +704,20 @@ function downloadGTNH(){
     return 1
   fi
 
-  validateGTNHarchive "$base_dir"
+  if ! validateGTNHarchive "$base_dir"; then
+    rm -rf "$original_base_dir" "$stage_marker"
+    return 1
+  fi
+  staged_relative="${base_dir#"$original_base_dir"}"
+  staged_relative="${staged_relative#/}"
+  jq -n \
+    --arg artifact_digest "$gtnh_manager_artifact_digest" \
+    --arg base_relative "$staged_relative" \
+    --arg validated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{artifact_digest: $artifact_digest, base_relative: $base_relative, validated_at: $validated_at}' \
+    > "${stage_marker}.tmp.$$" \
+    && mv -f "${stage_marker}.tmp.$$" "$stage_marker"
+  writeGTNHmanagerState staged
 }
 
 function rollbackGTNHupdate(){
@@ -493,6 +775,9 @@ function recoverInterruptedGTNHupdate(){
 }
 
 function validateGTNHpreUpdateBackupDestination(){
+  local available_kb=""
+  local required_kb=""
+
   if isFalse "${GTNH_PRE_UPDATE_BACKUP:-true}"; then
     return 0
   fi
@@ -500,146 +785,47 @@ function validateGTNHpreUpdateBackupDestination(){
     logError "/backups must be mounted read-write and writable by the Minecraft UID to create the required pre-upgrade backup."
     return 1
   fi
+  if [[ ! -s "$GTNH_RESTIC_PASSWORD_FILE" ]]; then
+    logError "Restic password file is missing or empty: $GTNH_RESTIC_PASSWORD_FILE"
+    return 1
+  fi
+  if [[ ! "$GTNH_BACKUP_MIN_FREE_GB" =~ ^[1-9][0-9]*$ ]]; then
+    logError "GTNH_BACKUP_MIN_FREE_GB must be a positive integer."
+    return 1
+  fi
+  available_kb="$(df -Pk /backups | awk 'NR == 2 {print $4}')"
+  required_kb=$((GTNH_BACKUP_MIN_FREE_GB * 1024 * 1024))
+  if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < required_kb )); then
+    logError "At least ${GTNH_BACKUP_MIN_FREE_GB} GiB must remain free before a pre-upgrade snapshot."
+    return 1
+  fi
 }
 
 function createGTNHpreUpdateBackup(){
-  local backup_pid=""
-  local backup_dir="/backups"
-  local backup_name=""
-  local backup_path=""
-  local backup_status=0
-  local backup_size_bytes=0
-  local compression_threads="${GTNH_PRE_UPDATE_BACKUP_THREADS:-0}"
-  local compressor_name="gzip"
-  local current_datetime=""
   local current_id="unknown"
-  local elapsed_seconds=0
-  local monitor_pid=""
-  local progress_interval="${GTNH_PRE_UPDATE_BACKUP_PROGRESS_SECONDS:-30}"
-  local safe_current_id=""
-  local safe_target_id=""
-  local stale_temp_path=""
-  local started_epoch=0
   local target_id=""
-  local temp_path=""
-  local -a compressor=(gzip -1)
-  local -a decompressor=(gzip -dc)
 
   if isFalse "${GTNH_PRE_UPDATE_BACKUP:-true}"; then
-    logWarning "GTNH_PRE_UPDATE_BACKUP is disabled; continuing without an exact pre-upgrade data archive."
+    logWarning "GTNH_PRE_UPDATE_BACKUP is disabled; continuing without an exact pre-upgrade snapshot."
     return 0
   fi
   if ! validateGTNHpreUpdateBackupDestination; then
     return 1
   fi
 
-  current_datetime="$(date +%Y-%m-%dT%H%M%S)"
   [[ -s /data/.gtnh-version ]] && current_id="$(head -n 1 /data/.gtnh-version)"
   target_id="$(selectedGTNHversionMarker)"
-  safe_current_id="$(safeGTNHbuildId "$current_id")"
-  safe_target_id="$(safeGTNHbuildId "$target_id")"
-  backup_name="gtnh-pre-upgrade-${safe_current_id}-to-${safe_target_id}-${current_datetime}.tar.gz"
-  backup_path="$backup_dir/$backup_name"
-  temp_path="$backup_dir/.${backup_name}.tmp.$$"
-
-  stale_temp_path="$(find "$backup_dir" -maxdepth 1 -type f -name '.gtnh-pre-upgrade-*.tmp.*' -print -quit)"
-  if [[ -n "$stale_temp_path" ]]; then
-    logWarning "Removing an incomplete pre-upgrade backup left by an interrupted deployment."
-    if ! find "$backup_dir" -maxdepth 1 -type f -name '.gtnh-pre-upgrade-*.tmp.*' -delete; then
-      logError "Unable to remove an incomplete pre-upgrade backup from $backup_dir."
-      return 1
-    fi
+  if [[ -n "$gtnh_manager_snapshot_id" ]] && gtnhResticSnapshotExists "$gtnh_manager_snapshot_id"; then
+    gtnhManagerLog "[4/5] Reusing committed safety snapshot $gtnh_manager_snapshot_id."
+    return 0
   fi
 
-  if ! [[ "$progress_interval" =~ ^[1-9][0-9]*$ ]]; then
-    logWarning "Invalid GTNH_PRE_UPDATE_BACKUP_PROGRESS_SECONDS=$progress_interval; using 30 seconds."
-    progress_interval=30
-  fi
-  if command -v pigz >/dev/null 2>&1; then
-    compressor=(pigz -1)
-    decompressor=(pigz -dc)
-    compressor_name="parallel gzip"
-    if [[ "$compression_threads" =~ ^[1-9][0-9]*$ ]]; then
-      compressor+=(-p "$compression_threads")
-      compressor_name="parallel gzip with $compression_threads threads"
-    elif [[ "$compression_threads" != "0" ]]; then
-      logWarning "Invalid GTNH_PRE_UPDATE_BACKUP_THREADS=$compression_threads; using all available CPUs."
-    fi
-  fi
-
-  gtnh_pre_update_backup_temp="$temp_path"
-  started_epoch="$(date +%s)"
-  log "Creating offline pre-upgrade data backup at $backup_path using $compressor_name with inline integrity validation."
-  (
-    set -o pipefail
-    cd /data || exit 1
-    tar \
-      --exclude='./.tmp' \
-      --exclude='./.gtnh-recovery' \
-      --exclude='./backups' \
-      --exclude='./cache' \
-      --exclude='./crash-reports' \
-      --exclude='./logs' \
-      --exclude='./packs' \
-      --exclude='./gtnh-upgrade-*' \
-      --exclude='./libraries' \
-      --exclude='./mods' \
-      --exclude='./journeymap' \
-      --exclude='./World-*.zip' \
-      --exclude='./*.jar' \
-      -cf - . \
-      | "${compressor[@]}" \
-      | tee "$temp_path" \
-      | "${decompressor[@]}" \
-      | tar -tf - >/dev/null
-  ) &
-  backup_pid="$!"
-
-  (
-    while kill -0 "$backup_pid" 2>/dev/null; do
-      sleep "$progress_interval"
-      kill -0 "$backup_pid" 2>/dev/null || break
-      backup_size_bytes="$(stat -c %s "$temp_path" 2>/dev/null || printf '0')"
-      elapsed_seconds=$(( $(date +%s) - started_epoch ))
-      log "Pre-upgrade backup in progress: $(( backup_size_bytes / 1024 / 1024 )) MiB written in ${elapsed_seconds}s."
-    done
-  ) &
-  monitor_pid="$!"
-
-  if wait "$backup_pid"; then
-    backup_status=0
-  else
-    backup_status=$?
-  fi
-  kill "$monitor_pid" 2>/dev/null || true
-  wait "$monitor_pid" 2>/dev/null || true
-
-  if (( backup_status != 0 )); then
-    rm -f "$temp_path"
-    gtnh_pre_update_backup_temp=""
-    logError "Failed to create the pre-upgrade GTNH data backup."
+  gtnhManagerLog "[4/5] Creating an incremental pre-upgrade safety snapshot."
+  if ! createGTNHresticSnapshot pre-upgrade "$current_id" "$target_id"; then
     return 1
   fi
-
-  log "Backup stream validated; flushing the archive file to storage."
-  if ! sync "$temp_path"; then
-    rm -f "$temp_path"
-    gtnh_pre_update_backup_temp=""
-    logError "Pre-upgrade GTNH data backup could not be flushed to storage."
-    return 1
-  fi
-  if ! mv "$temp_path" "$backup_path"; then
-    rm -f "$temp_path"
-    gtnh_pre_update_backup_temp=""
-    logError "Unable to commit the verified pre-upgrade GTNH data backup."
-    return 1
-  fi
-  gtnh_pre_update_backup_temp=""
-  if ! date -u +%s > "$backup_dir/.last-verified.tmp.$$" ||
-     ! mv "$backup_dir/.last-verified.tmp.$$" "$backup_dir/.last-verified"; then
-    logWarning "Backup is valid, but the .last-verified health marker could not be updated."
-  fi
-  log "Verified offline pre-upgrade data backup: $backup_path"
+  gtnh_manager_snapshot_id="$GTNH_RESTIC_SNAPSHOT_ID"
+  writeGTNHmanagerState snapshot-committed
 }
 
 function updateGTNH(){
@@ -659,6 +845,9 @@ function updateGTNH(){
     logError "Refusing to update GTNH without a verified pre-upgrade data backup."
     return 1
   fi
+
+  writeGTNHmanagerState applying
+  gtnhManagerLog "[5/5] Applying the validated pack transaction."
 
   mapfile -t managed_resources < <(gtnhManagedResources)
   current_datetime="$(date +%Y-%m-%dT%H%M%S)"
@@ -741,6 +930,7 @@ function updateGTNH(){
     return 1
   fi
   log "Transactional GTNH pack update completed. Rollback snapshot retained at $backup_folder."
+  writeGTNHmanagerState applied
 }
 
 function hasExistingGTNHinstall(){
@@ -754,32 +944,24 @@ function installGTNH(){
 
 function cleanupGTNHtemporaryFiles(){
   rm -rf /data/.tmp
-  if [[ -n "$gtnh_pre_update_backup_temp" ]]; then
-    rm -f "$gtnh_pre_update_backup_temp"
-    gtnh_pre_update_backup_temp=""
-  fi
 }
 
 function handleGTNH() {
   : "${GTNH_PACK_VERSION:=2.9.0-beta-2}"
-  : "${GTNH_DELETE_BACKUPS:=false}"
   : "${SKIP_GTNH_UPDATE_CHECK:=false}"
   : "${GTNH_PACK_URL:=}"
   : "${GTNH_PACK_SHA256:=}"
-  debug "GTNH VAR CHECK: GTNH_DELETE_BACKUPS=$GTNH_DELETE_BACKUPS, GTNH_PACK_VERSION=$GTNH_PACK_VERSION, GTNH_PACK_URL=$GTNH_PACK_URL, TYPE=$TYPE, SKIP_GTNH_UPDATE_CHECK=$SKIP_GTNH_UPDATE_CHECK"
+  debug "GTNH VAR CHECK: GTNH_PACK_VERSION=$GTNH_PACK_VERSION, GTNH_PACK_URL=$GTNH_PACK_URL, TYPE=$TYPE, SKIP_GTNH_UPDATE_CHECK=$SKIP_GTNH_UPDATE_CHECK"
 
   if ! recoverInterruptedGTNHupdate; then
     logError "Manual recovery is required before GTNH can start."
     exit 1
   fi
 
-  if isTrue "$GTNH_DELETE_BACKUPS"; then
-    deleteGTNHbackup
-  fi
-
   if [[ -n $GTNH_PACK_VERSION ]] && isFalse "$SKIP_GTNH_UPDATE_CHECK" ; then
     if exactDailyGTNHisAlreadyInstalled; then
       log "No update required: the exact pinned daily build is already installed."
+      finalizeInstalledGTNHmanagerOperation
       return 0
     fi
 
@@ -798,6 +980,8 @@ function handleGTNH() {
 
     if [[ ! -f /data/.gtnh-version || "$selected_marker" != "$(cat /data/.gtnh-version)" ]]; then
       log "Update/install required: selected build is $selected_marker."
+      initializeGTNHmanagerOperation
+      gtnhManagerLog "[1/5] Resolved target $selected_marker."
 
       if hasExistingGTNHinstall && ! validateGTNHpreUpdateBackupDestination; then
         logError "Refusing to download or update GTNH until the backup destination is writable."
@@ -826,10 +1010,11 @@ function handleGTNH() {
         logError "GTNH files were installed, but the version marker could not be written."
         exit 1
       fi
-      rm -rf "$original_base_dir"
+      completeGTNHmanagerOperation
 
     else
       log "No update required: /data/.gtnh-version matches $selected_marker."
+      finalizeInstalledGTNHmanagerOperation
     fi
   else
     log "SKIP_GTNH_UPDATE_CHECK=$SKIP_GTNH_UPDATE_CHECK ... Skipping GTNH Update/Install"
@@ -842,35 +1027,25 @@ function setGTNHconfigValue() {
   local value="$3"
 
   if [[ ! -f "$file" ]]; then
-    logWarning "Safety override skipped because config is missing: $file"
+    logWarning "GTNH setting skipped because config is missing: $file"
     return
   fi
 
   if ! grep -Eq "^[[:space:]]*$key=" "$file"; then
-    logWarning "Safety override key is missing from $file: $key"
+    logWarning "GTNH setting key is missing from $file: $key"
     return
   fi
 
   sed -i -E "s|^([[:space:]]*)$key=.*|\\1$key=$value|" "$file"
-  log "Applied safety override $key=$value in $file"
+  log "Applied GTNH setting $key=$value in $file"
 }
 
-function applyGTNHSafetyOverrides() {
-  local hodgepodge="/data/config/hodgepodge.cfg"
+function applyGTNHBackupDefaults() {
   local serverutilities="/data/serverutilities/serverutilities.cfg"
 
-  if isTrue "${GTNH_DISABLE_OPTIMIZED_CHUNK_COMPRESSION:-true}"; then
-    setGTNHconfigValue "$hodgepodge" "B:speedupChunkCompression" "false"
-    setGTNHconfigValue "$hodgepodge" "B:poolZlibInstances" "false"
-  fi
-
-  if isTrue "${GTNH_CHUNK_SAVE_DEBUG:-true}"; then
-    setGTNHconfigValue "$hodgepodge" "B:chunkSaveCMEDebug" "true"
-  fi
-
   setGTNHconfigValue "$serverutilities" "S:backup_timer" "${GTNH_INTERNAL_BACKUP_TIMER:-0.5}"
-  setGTNHconfigValue "$serverutilities" "I:backups_to_keep" "${GTNH_INTERNAL_BACKUPS_TO_KEEP:-48}"
-  setGTNHconfigValue "$serverutilities" "I:max_folder_size" "${GTNH_INTERNAL_BACKUP_MAX_GB:-35}"
+  setGTNHconfigValue "$serverutilities" "I:backups_to_keep" "${GTNH_INTERNAL_BACKUPS_TO_KEEP:-24}"
+  setGTNHconfigValue "$serverutilities" "I:max_folder_size" "${GTNH_INTERNAL_BACKUP_MAX_GB:-20}"
   setGTNHconfigValue "$serverutilities" "I:compression_level" "${GTNH_INTERNAL_BACKUP_COMPRESSION:-4}"
   setGTNHconfigValue "$serverutilities" "B:only_backup_claimed_chunks" "${GTNH_INTERNAL_BACKUP_CLAIMED_ONLY:-true}"
   setGTNHconfigValue "$serverutilities" "B:backup_entire_regions_with_claims" "${GTNH_INTERNAL_BACKUP_WHOLE_REGIONS:-true}"
@@ -905,7 +1080,7 @@ function main(){
   export VERSION=1.7.10
 
   handleGTNH
-  applyGTNHSafetyOverrides
+  applyGTNHBackupDefaults
 
   export USES_MODS=true
   cleanupGTNHtemporaryFiles

@@ -9,15 +9,14 @@ By default it is configured to:
 - allocate `12G` of Java heap so the 22 GiB host retains native-memory headroom
 - keep RCON private and share the image-generated credential through the data volume
 - allow nine minutes for Minecraft and ten minutes for Docker shutdown
-- keep 14 verified full backups at 12-hour intervals without recursively archiving backups
-- keep claimed-region ServerUtilities backups within a 35 GB cap
-- stop and quarantine the server when chunk-corruption signatures appear
-- disable automatic full-world restores and Forge query confirmation by default
-- disable optimized chunk compression and zlib pooling while chunk-save diagnostics are enabled
+- keep verified, deduplicated Restic snapshots at 12-hour intervals
+- keep claimed-region ServerUtilities backups within a 20 GB cap
+- never auto-restore backup archives, and disable Forge query confirmation by default
 - limit automatic Minecraft restart attempts to three
 - keep the whitelist enabled from first boot
 - bridge GTNH download metadata gaps for pinned releases
 - install tested DreamAssemblerXXL daily server artifacts with digest checks and transactional rollback
+- cache verified server artifacts and resume interrupted update work across redeploys
 
 ## Official GTNH links
 
@@ -30,10 +29,11 @@ By default it is configured to:
 ## Files
 
 - `docker-compose.yml`: the deployable Coolify/Compose stack
-- `Dockerfile`: tiny wrapper around `itzg/minecraft-server` for startup recovery and the GTNH resolver override
-- `docker/gtnh-entrypoint.sh`: enforces corruption quarantine and retains opt-in level.dat recovery
-- `docker/gtnh-corruption-guard.sh`: records evidence and stops Minecraft on corruption
-- `docker/start-deployGTNH`: resolves releases/dailies, validates server archives, updates transactionally, and reapplies operational safety settings
+- `Dockerfile`: wrapper around `itzg/minecraft-server` with Restic and the GTNH resolver override
+- `docker/gtnh-entrypoint.sh`: prepares shared Restic ownership and credentials before normal startup
+- `docker/gtnh-restic.sh`: shared Restic snapshot, verification, and progress logging functions
+- `docker/gtnhctl`: terminal utility for status, logs, snapshots, checks, cache management, and staged restores
+- `docker/start-deployGTNH`: resolves releases/dailies, validates server archives, updates transactionally, and applies bounded backup settings
 - `ops/gtnh-graceful-shutdown*`: host shutdown hook and Docker stop helper
 - `.env.example`: envs you can copy into Coolify or a local `.env`
 
@@ -104,7 +104,7 @@ GTNH_PACK_URL=
 GTNH_GITHUB_TOKEN=<Coolify secret with read-only Actions access>
 ```
 
-`latest-daily` is also supported, but an exact daily ID is safer for production because server and clients remain pinned together. GitHub Actions artifacts expire after 90 days. An installed exact daily continues to start after expiry, but reinstalling that build onto an empty volume requires the artifact to still exist.
+`latest-daily` is also supported, but an exact daily ID is safer for production because server and clients remain pinned together. GitHub Actions artifacts eventually expire. Once this stack has verified an artifact, it keeps the ZIP under `/data/packs/artifacts/<sha256>.zip`, so ordinary redeploys and interrupted extraction do not depend on GitHub still serving it. Keep client and server artifacts somewhere outside the VPS as well.
 
 The daily updater fails before changing `/data` unless the artifact:
 
@@ -113,7 +113,11 @@ The daily updater fails before changing `/data` unless the artifact:
 - contains the complete server runtime, including `config`, `mods`, `libraries`, Forge, and the Java 17+ launcher
 - contains a plausible assembled server set rather than the config-only nightly's seven mod metadata entries and zero mod JARs
 
-Updates replace only pack-managed runtime paths. Worlds, player data, `server.properties`, whitelist/ops/ban files, `serverutilities`, custom server icon, backups, and other unrelated `/data` content are not touched. Existing `config/JourneyMapServer` data is restored into the new config. Before files move, the stopped server creates and verifies `gtnh-pre-upgrade-*.tar.gz` on the separate `/backups` volume; this captures the exact world/player/admin state before any newer mod can migrate it. The backup uses parallel gzip by default, validates the gzip and tar stream while writing it, reports its growing archive size every 30 seconds, and flushes the verified archive to storage before the update continues. Set `GTNH_PRE_UPDATE_BACKUP_THREADS` to a positive number to limit CPU use, or leave it at `0` to use all available CPUs. The previous managed runtime and full prior config remain under `/data/gtnh-upgrade-*`; an interrupted transaction is rolled back on the next startup before Minecraft launches.
+Updates replace only pack-managed runtime paths. Worlds, player data, `server.properties`, whitelist/ops/ban files, `serverutilities`, custom server icon, backups, and other unrelated `/data` content are not touched. Existing `config/JourneyMapServer` data is restored into the new config.
+
+The update manager journals each operation under `/data/.gtnh-manager/state.json`. Downloads use a resumable `.part` file, verified artifacts are addressed by SHA-256, and validated extracted staging survives a canceled deployment. On restart it resumes the latest valid stage and reuses an already committed pre-upgrade snapshot. The two most recently used artifacts and two managed-file rollback directories are retained by default.
+
+Immediately before files move, the stopped server creates and reopens a Restic snapshot on `/backups`. The first Restic snapshot is a one-time baseline and still must read and store the persistent data. Later snapshots use content deduplication and file metadata to avoid recompressing unchanged world data. Progress is logged every ten seconds, and the latest two pre-upgrade snapshots are retained by default. The previous managed runtime and prior config also remain under `/data/gtnh-upgrade-*`; an interrupted file transaction is rolled back on the next startup before Minecraft launches.
 
 ## Graceful shutdown
 
@@ -127,41 +131,53 @@ An OVH hard reset can bypass userspace shutdown hooks, so verified backups remai
 
 ## Backups
 
-The `gtnh-backups` service waits for Minecraft health, loads the image-generated RCON credential from the shared `/data/.rcon-cli.env`, then coordinates `save-off`, `save-all`, and `save-on`. It runs every 12 hours and retains no more than 14 archives or seven days. Internal backup trees, recovery snapshots, upgrade snapshots, logs, caches, jars, and downloaded packs are excluded.
+The `gtnh-backups` service waits for Minecraft health, loads the image-generated RCON credential from the shared `/data/.rcon-cli.env`, then coordinates `save-off`, `save-all flush`, and `save-on`. It creates a deduplicated Restic snapshot every 12 hours. The storage-conscious default keeps snapshots from the last 24 hours, seven daily, four weekly, and three monthly restore points. Policies overlap, so Restic does not retain a separate duplicate for every rule. Internal backup trees, recovery snapshots, upgrade snapshots, logs, caches, jars, and downloaded packs are excluded.
 
-Each archive must pass `gzip -t`. Successful verification updates `/backups/.last-verified`, and the backup container becomes unhealthy when that marker is older than 13 hours.
+Pre-upgrade and scheduled snapshots share `/backups/restic`. Successful snapshots are reopened by ID before `/backups/.last-verified` is updated, and the backup container becomes unhealthy when that marker is older than 13 hours. New snapshots are refused when less than 20 GiB remains free. Retention cannot guarantee a fixed repository size because world churn varies, so keep the health check and `gtnhctl doctor` monitored.
 
-ServerUtilities supplies the faster tier every 30 minutes using complete region files containing claimed chunks. It retains up to 48 archives within a 35 GB cap. Full sidecar archives and the VPS Backblaze snapshots protect unclaimed areas.
+Set `GTNH_RESTIC_PASSWORD` to a long Coolify secret before the first deployment. If it is blank, the entrypoint generates `/backups/.gtnh-restic-password`; preserve that file separately because snapshots cannot be opened without it. Changing the configured password later does not rotate the repository key and is intentionally rejected.
 
-Automatic full-world restoration is disabled by default because an unreviewed restore can erase unrelated progress. The prior implementation remains opt-in:
+ServerUtilities supplies the faster tier every 30 minutes using complete region files containing claimed chunks. It retains up to 24 archives within a 20 GB cap. Restic snapshots and the VPS Backblaze snapshots protect unclaimed areas.
 
-```env
-AUTO_RESTORE_ON_CORRUPT_LEVELDAT=true
-AUTO_RESTORE_ON_FML_LEVELDAT_WARNING=true
+The retired tar/ZIP backup path is not scanned, adapted, or restored automatically, and there is no environment variable that re-enables it. Existing archives are left untouched so they can be inspected manually. After verifying a Restic baseline, remove obsolete archives yourself if their disk usage is no longer justified. Do not enable automatic Forge query confirmation in production; missing block or item mappings require operator review.
+
+## Terminal utility
+
+Run `gtnhctl` from the `gtnh` service terminal in Coolify. It is non-interactive and emits colored output only when attached to a terminal.
+
+```bash
+gtnhctl status
+gtnhctl logs 100 --follow
+gtnhctl snapshots
+gtnhctl backup
+gtnhctl check
+gtnhctl cache
+gtnhctl cache prune 3
+gtnhctl doctor
 ```
 
-Do not enable automatic Forge query confirmation in production. Missing block or item mappings require operator review.
+Restores are staged and verified away from live data. This command restores only `World` into a new recovery directory and prints the resulting path:
 
-## Corruption quarantine
+```bash
+gtnhctl restore <snapshot-id> --world World
+gtnhctl legacy-restore /backups/<old-archive>.tar.gz --dry-run
+```
 
-The runtime guard watches only new log lines for missing Level data, rejected chunk roots, malformed UTF, null chunks, and save failures. On detection it:
+Inspect the staged copy before replacing any live world. `legacy-restore` only reads the exact old archive you name and never participates in startup recovery. For a Restic preview, append `--dry-run`. `gtnhctl` refuses `/` and `/data` as restore targets.
 
-1. copies the current log under `/data/.gtnh-recovery/`
-2. writes `corruption-detected.marker` atomically
-3. sends Minecraft a normal RCON `stop`
-4. blocks later startup until the affected chunk is inspected and restored
+## Storage controls
 
-After recovery, set `CORRUPTION_GUARD_CLEAR=true` for one start and then return it to `false`.
-
-Useful operational controls:
+The default storage limits for a 256 GB host are:
 
 ```text
-CORRUPTION_GUARD_ENABLED=true
-GTNH_DISABLE_OPTIMIZED_CHUNK_COMPRESSION=true
-GTNH_CHUNK_SAVE_DEBUG=true
 BACKUP_INTERVAL=12h
-PRUNE_BACKUPS_COUNT=14
-PRUNE_BACKUPS_DAYS=7
+PRUNE_RESTIC_RETENTION=--keep-within 24h --keep-daily 7 --keep-weekly 4 --keep-monthly 3
+GTNH_BACKUP_MIN_FREE_GB=20
+GTNH_PRE_UPDATE_SNAPSHOTS_KEEP=2
+GTNH_ARTIFACT_CACHE_KEEP=2
+GTNH_TRANSACTION_BACKUPS_KEEP=2
+GTNH_INTERNAL_BACKUPS_TO_KEEP=24
+GTNH_INTERNAL_BACKUP_MAX_GB=20
 ```
 
 ## Whitelist and admin commands
@@ -183,6 +199,7 @@ stop
 ## Best-practice notes for this stack
 
 - Keep `/data` and `/backups` on persistent named volumes.
+- Preserve the Restic password outside those volumes.
 - Treat a missing or stale `.last-verified` marker as backup failure.
 - The backup volume shares the VPS disk; Backblaze B2 provides the off-site tier.
 - Leave RCON enabled for controlled administration and backup coordination, but do not expose its port publicly.
@@ -199,6 +216,7 @@ You can validate the compose file locally with:
 docker compose --env-file .env.example config
 docker compose --env-file .env.example build gtnh
 docker run --rm --entrypoint bash --tmpfs /data --tmpfs /backups --mount "type=bind,src=$((Resolve-Path tests).Path),dst=/tests,readonly" gtnh-minecraft-server:2026.5.3-java25 /tests/test-gtnh-deploy.sh
+docker run --rm --entrypoint bash --tmpfs /data --tmpfs /backups --mount "type=bind,src=$((Resolve-Path tests).Path),dst=/tests,readonly" gtnh-minecraft-server:2026.5.3-java25 /tests/test-gtnhctl.sh
 ```
 
 ## Sources
@@ -215,4 +233,7 @@ docker run --rm --entrypoint bash --tmpfs /data --tmpfs /backups --mount "type=b
 - JVM/memory docs: [https://docker-minecraft-server.readthedocs.io/en/latest/configuration/jvm-options/](https://docker-minecraft-server.readthedocs.io/en/latest/configuration/jvm-options/)
 - Healthcheck docs: [https://docker-minecraft-server.readthedocs.io/en/latest/misc/healthcheck/](https://docker-minecraft-server.readthedocs.io/en/latest/misc/healthcheck/)
 - Data directory docs: [https://docker-minecraft-server.readthedocs.io/en/latest/data-directory/](https://docker-minecraft-server.readthedocs.io/en/latest/data-directory/)
+- Restic backup docs: [https://restic.readthedocs.io/en/stable/040_backup.html](https://restic.readthedocs.io/en/stable/040_backup.html)
+- Restic restore docs: [https://restic.readthedocs.io/en/stable/050_restore.html](https://restic.readthedocs.io/en/stable/050_restore.html)
+- `itzg/mc-backup` Restic docs: [https://github.com/itzg/docker-mc-backup#restic](https://github.com/itzg/docker-mc-backup#restic)
 - Coolify Docker Compose docs: [https://coolify.io/docs/knowledge-base/docker/compose](https://coolify.io/docs/knowledge-base/docker/compose)
