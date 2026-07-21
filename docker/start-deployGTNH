@@ -523,6 +523,7 @@ function createGTNHpreUpdateBackup(){
   local target_id=""
   local temp_path=""
   local -a compressor=(gzip -1)
+  local -a decompressor=(gzip -dc)
 
   if isFalse "${GTNH_PRE_UPDATE_BACKUP:-true}"; then
     logWarning "GTNH_PRE_UPDATE_BACKUP is disabled; continuing without an exact pre-upgrade data archive."
@@ -556,6 +557,7 @@ function createGTNHpreUpdateBackup(){
   fi
   if command -v pigz >/dev/null 2>&1; then
     compressor=(pigz -1)
+    decompressor=(pigz -dc)
     compressor_name="parallel gzip"
     if [[ "$compression_threads" =~ ^[1-9][0-9]*$ ]]; then
       compressor+=(-p "$compression_threads")
@@ -567,7 +569,7 @@ function createGTNHpreUpdateBackup(){
 
   gtnh_pre_update_backup_temp="$temp_path"
   started_epoch="$(date +%s)"
-  log "Creating offline pre-upgrade data backup at $backup_path using $compressor_name."
+  log "Creating offline pre-upgrade data backup at $backup_path using $compressor_name with inline integrity validation."
   (
     set -o pipefail
     cd /data || exit 1
@@ -585,7 +587,11 @@ function createGTNHpreUpdateBackup(){
       --exclude='./journeymap' \
       --exclude='./World-*.zip' \
       --exclude='./*.jar' \
-      -cf - . | "${compressor[@]}" > "$temp_path"
+      -cf - . \
+      | "${compressor[@]}" \
+      | tee "$temp_path" \
+      | "${decompressor[@]}" \
+      | tar -tf - >/dev/null
   ) &
   backup_pid="$!"
 
@@ -615,11 +621,11 @@ function createGTNHpreUpdateBackup(){
     return 1
   fi
 
-  log "Backup compression completed; validating the full tar archive."
-  if ! tar -tzf "$temp_path" >/dev/null; then
+  log "Backup stream validated; flushing the archive to storage."
+  if ! sync -f "$temp_path"; then
     rm -f "$temp_path"
     gtnh_pre_update_backup_temp=""
-    logError "Pre-upgrade GTNH data backup verification failed."
+    logError "Pre-upgrade GTNH data backup could not be flushed to storage."
     return 1
   fi
   if ! mv "$temp_path" "$backup_path"; then
