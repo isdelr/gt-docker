@@ -12,6 +12,7 @@ GTNH_DAILY_REPOSITORY="${GTNH_DAILY_REPOSITORY:-GTNewHorizons/DreamAssemblerXXL}
 GTNH_DAILY_WORKFLOW="${GTNH_DAILY_WORKFLOW:-daily-modpack-build.yml}"
 GTNH_GITHUB_API="${GTNH_GITHUB_API:-https://api.github.com}"
 GTNH_UPDATE_MARKER="/data/.gtnh-update-in-progress"
+gtnh_pre_update_backup_temp=""
 
 function setGTNHdownloadPath(){
   gtnh_download_path="$1"
@@ -502,15 +503,26 @@ function validateGTNHpreUpdateBackupDestination(){
 }
 
 function createGTNHpreUpdateBackup(){
+  local backup_pid=""
   local backup_dir="/backups"
   local backup_name=""
   local backup_path=""
+  local backup_status=0
+  local backup_size_bytes=0
+  local compression_threads="${GTNH_PRE_UPDATE_BACKUP_THREADS:-0}"
+  local compressor_name="gzip"
   local current_datetime=""
   local current_id="unknown"
+  local elapsed_seconds=0
+  local monitor_pid=""
+  local progress_interval="${GTNH_PRE_UPDATE_BACKUP_PROGRESS_SECONDS:-30}"
   local safe_current_id=""
   local safe_target_id=""
+  local stale_temp_path=""
+  local started_epoch=0
   local target_id=""
   local temp_path=""
+  local -a compressor=(gzip -1)
 
   if isFalse "${GTNH_PRE_UPDATE_BACKUP:-true}"; then
     logWarning "GTNH_PRE_UPDATE_BACKUP is disabled; continuing without an exact pre-upgrade data archive."
@@ -529,38 +541,94 @@ function createGTNHpreUpdateBackup(){
   backup_path="$backup_dir/$backup_name"
   temp_path="$backup_dir/.${backup_name}.tmp.$$"
 
-  log "Creating offline pre-upgrade data backup at $backup_path."
-  if ! (
+  stale_temp_path="$(find "$backup_dir" -maxdepth 1 -type f -name '.gtnh-pre-upgrade-*.tmp.*' -print -quit)"
+  if [[ -n "$stale_temp_path" ]]; then
+    logWarning "Removing an incomplete pre-upgrade backup left by an interrupted deployment."
+    if ! find "$backup_dir" -maxdepth 1 -type f -name '.gtnh-pre-upgrade-*.tmp.*' -delete; then
+      logError "Unable to remove an incomplete pre-upgrade backup from $backup_dir."
+      return 1
+    fi
+  fi
+
+  if ! [[ "$progress_interval" =~ ^[1-9][0-9]*$ ]]; then
+    logWarning "Invalid GTNH_PRE_UPDATE_BACKUP_PROGRESS_SECONDS=$progress_interval; using 30 seconds."
+    progress_interval=30
+  fi
+  if command -v pigz >/dev/null 2>&1; then
+    compressor=(pigz -1)
+    compressor_name="parallel gzip"
+    if [[ "$compression_threads" =~ ^[1-9][0-9]*$ ]]; then
+      compressor+=(-p "$compression_threads")
+      compressor_name="parallel gzip with $compression_threads threads"
+    elif [[ "$compression_threads" != "0" ]]; then
+      logWarning "Invalid GTNH_PRE_UPDATE_BACKUP_THREADS=$compression_threads; using all available CPUs."
+    fi
+  fi
+
+  gtnh_pre_update_backup_temp="$temp_path"
+  started_epoch="$(date +%s)"
+  log "Creating offline pre-upgrade data backup at $backup_path using $compressor_name."
+  (
     set -o pipefail
-    cd /data
+    cd /data || exit 1
     tar \
       --exclude='./.tmp' \
+      --exclude='./.gtnh-recovery' \
       --exclude='./backups' \
       --exclude='./cache' \
+      --exclude='./crash-reports' \
       --exclude='./logs' \
       --exclude='./packs' \
       --exclude='./gtnh-upgrade-*' \
       --exclude='./libraries' \
       --exclude='./mods' \
       --exclude='./journeymap' \
+      --exclude='./World-*.zip' \
       --exclude='./*.jar' \
-      -cf - . | gzip -1 > "$temp_path"
-  ); then
+      -cf - . | "${compressor[@]}" > "$temp_path"
+  ) &
+  backup_pid="$!"
+
+  (
+    while kill -0 "$backup_pid" 2>/dev/null; do
+      sleep "$progress_interval"
+      kill -0 "$backup_pid" 2>/dev/null || break
+      backup_size_bytes="$(stat -c %s "$temp_path" 2>/dev/null || printf '0')"
+      elapsed_seconds=$(( $(date +%s) - started_epoch ))
+      log "Pre-upgrade backup in progress: $(( backup_size_bytes / 1024 / 1024 )) MiB written in ${elapsed_seconds}s."
+    done
+  ) &
+  monitor_pid="$!"
+
+  if wait "$backup_pid"; then
+    backup_status=0
+  else
+    backup_status=$?
+  fi
+  kill "$monitor_pid" 2>/dev/null || true
+  wait "$monitor_pid" 2>/dev/null || true
+
+  if (( backup_status != 0 )); then
     rm -f "$temp_path"
+    gtnh_pre_update_backup_temp=""
     logError "Failed to create the pre-upgrade GTNH data backup."
     return 1
   fi
 
-  if ! gzip -t "$temp_path" || ! tar -tzf "$temp_path" >/dev/null; then
+  log "Backup compression completed; validating the full tar archive."
+  if ! tar -tzf "$temp_path" >/dev/null; then
     rm -f "$temp_path"
+    gtnh_pre_update_backup_temp=""
     logError "Pre-upgrade GTNH data backup verification failed."
     return 1
   fi
   if ! mv "$temp_path" "$backup_path"; then
     rm -f "$temp_path"
+    gtnh_pre_update_backup_temp=""
     logError "Unable to commit the verified pre-upgrade GTNH data backup."
     return 1
   fi
+  gtnh_pre_update_backup_temp=""
   if ! date -u +%s > "$backup_dir/.last-verified.tmp.$$" ||
      ! mv "$backup_dir/.last-verified.tmp.$$" "$backup_dir/.last-verified"; then
     logWarning "Backup is valid, but the .last-verified health marker could not be updated."
@@ -680,6 +748,10 @@ function installGTNH(){
 
 function cleanupGTNHtemporaryFiles(){
   rm -rf /data/.tmp
+  if [[ -n "$gtnh_pre_update_backup_temp" ]]; then
+    rm -f "$gtnh_pre_update_backup_temp"
+    gtnh_pre_update_backup_temp=""
+  fi
 }
 
 function handleGTNH() {

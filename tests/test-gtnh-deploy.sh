@@ -101,6 +101,7 @@ function testTransactionalUpdate(){
   printf 'custom-icon\n' > /data/server-icon.png
   printf 'serverutilities-state\n' > /data/serverutilities/state.dat
   printf 'GT_New_Horizons_2.9.0-beta-2_Server_Java_17-25.zip\n' > /data/.gtnh-version
+  printf 'interrupted-backup\n' > /backups/.gtnh-pre-upgrade-stale.tmp.999
 
   makeValidPack "$stage"
   mkdir -p "$stage/config/JourneyMapServer" "$stage/journeymap"
@@ -124,6 +125,7 @@ function testTransactionalUpdate(){
   [[ -f /data/mods/a.jar && ! -e /data/mods/old.jar ]]
   [[ -f /data/journeymap/new.txt && ! -e /data/journeymap/old.txt ]]
   [[ ! -e "$GTNH_UPDATE_MARKER" ]]
+  [[ ! -e /backups/.gtnh-pre-upgrade-stale.tmp.999 ]]
 
   backup="$(find /data -maxdepth 1 -type d -name 'gtnh-upgrade-*' -print -quit)"
   [[ -n "$backup" ]]
