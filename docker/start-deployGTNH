@@ -6,12 +6,11 @@
 . /usr/local/lib/gtnh-restic.sh
 
 # This is the upstream GTNH deploy flow with exact release and tested daily
-# artifact support plus transactional updates for persistent servers.
-CUSTOM_GTNH_RESOLVER_MARKER="custom-gtnh-resolver-20260720"
+# mirror support plus transactional updates for persistent servers.
+CUSTOM_GTNH_RESOLVER_MARKER="custom-gtnh-resolver-20260906"
 log "Using custom GTNH resolver override: ${CUSTOM_GTNH_RESOLVER_MARKER}"
 
-GTNH_DAILY_REPOSITORY="${GTNH_DAILY_REPOSITORY:-GTNewHorizons/DreamAssemblerXXL}"
-GTNH_DAILY_WORKFLOW="${GTNH_DAILY_WORKFLOW:-daily-modpack-build.yml}"
+GTNH_DAILY_RELEASE_REPOSITORY="${GTNH_DAILY_RELEASE_REPOSITORY:-GTNewHorizons/GTNH-Daily-Builds}"
 GTNH_GITHUB_API="${GTNH_GITHUB_API:-https://api.github.com}"
 GTNH_UPDATE_MARKER="/data/.gtnh-update-in-progress"
 GTNH_MANAGER_STATE_FILE="${GTNH_MANAGER_STATE_FILE:-/data/.gtnh-manager/state.json}"
@@ -46,143 +45,105 @@ function isExactDailyGTNHpackVersion(){
   [[ "${GTNH_PACK_VERSION:-}" =~ ^daily-[0-9]{4}-[0-9]{2}-[0-9]{2}\+[0-9]+$ ]]
 }
 
-function exactDailyGTNHversionMarker(){
-  local java_release=""
-  local java_variant=""
-  java_release="$(mc-image-helper java-release)"
-  if (( java_release == 8 )); then
-    java_variant="server-java8"
+function dailyGTNHarchiveMatchesJava(){
+  local name="$1" tag="$2" java_release="$3"
+  local prefix="GTNH-${tag}-server-java"
+  [[ "$name" == "$prefix"* ]] || return 1
+  local variant="${name#"$prefix"}"
+  if [[ "$variant" == "8.zip" ]]; then
+    (( java_release == 8 ))
+  elif [[ "$variant" =~ ^17-([0-9]+)\.zip$ ]]; then
+    (( java_release >= 17 && java_release <= 10#${BASH_REMATCH[1]} ))
   else
-    java_variant="server-java17-25"
+    return 1
   fi
-  printf 'GTNH-%s-%s.zip\n' "$GTNH_PACK_VERSION" "$java_variant"
+}
+
+# Accept only assembled server ZIPs for this exact build and JVM range.
+function compatibleDailyGTNHarchive(){
+  local tag="$1" candidate=""
+  while IFS= read -r candidate; do
+    if dailyGTNHarchiveMatchesJava "$(jq -r '.name' <<< "$candidate")" "$tag" "$current_java_version"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(jq -c --arg prefix "GTNH-${tag}-server-java" \
+    'map(select(.name | startswith($prefix))) | sort_by(.created_at) | reverse | .[]')
+  return 1
 }
 
 function exactDailyGTNHisAlreadyInstalled(){
   isExactDailyGTNHpackVersion || return 1
   [[ -s /data/.gtnh-version ]] || return 1
-  [[ "$(exactDailyGTNHversionMarker)" == "$(cat /data/.gtnh-version)" ]]
-}
-
-function hasGTNHgithubToken(){
-  local xtrace_enabled="false"
-  [[ $- == *x* ]] && xtrace_enabled="true" && set +x
-  [[ -n "${GTNH_GITHUB_TOKEN:-}" ||
-     (-n "${GTNH_GITHUB_TOKEN_FILE:-}" && -s "${GTNH_GITHUB_TOKEN_FILE}") ]]
-  local status=$?
-  isTrue "$xtrace_enabled" && set -x
-  return "$status"
+  dailyGTNHarchiveMatchesJava "$(cat /data/.gtnh-version)" "$GTNH_PACK_VERSION" "$(mc-image-helper java-release)"
 }
 
 function githubApiCurl(){
-  local xtrace_enabled="false"
-  local github_token=""
-  local status=0
-  [[ $- == *x* ]] && xtrace_enabled="true" && set +x
-
-  if [[ -n "${GTNH_GITHUB_TOKEN:-}" ]]; then
-    github_token="$GTNH_GITHUB_TOKEN"
-  elif [[ -n "${GTNH_GITHUB_TOKEN_FILE:-}" && -s "${GTNH_GITHUB_TOKEN_FILE}" ]]; then
-    github_token="$(<"$GTNH_GITHUB_TOKEN_FILE")"
-  fi
-
-  if [[ -n "$github_token" ]]; then
-    curl -fsSL \
-      -H 'Accept: application/vnd.github+json' \
-      -H 'X-GitHub-Api-Version: 2022-11-28' \
-      -H "Authorization: Bearer $github_token" \
-      "$@"
-    status=$?
-  else
-    curl -fsSL \
-      -H 'Accept: application/vnd.github+json' \
-      -H 'X-GitHub-Api-Version: 2022-11-28' \
-      "$@"
-    status=$?
-  fi
-
-  github_token=""
-  isTrue "$xtrace_enabled" && set -x
-  return "$status"
+  curl -fsSL \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' \
+    "$@"
 }
 
 function selectDailyGTNHpack(){
-  local artifacts_url=""
-  local artifacts_json=""
-  local artifact=""
-  local artifact_name=""
-  local build_id=""
-  local java_variant=""
-  local run_json=""
+  local release_url="$GTNH_GITHUB_API/repos/$GTNH_DAILY_RELEASE_REPOSITORY/releases"
+  local response="" http_status="" releases_json="" release="" tag="" asset=""
 
   isDailyGTNHpackVersion || return 1
-
-  if ! hasGTNHgithubToken; then
-    logError "GTNH_GITHUB_TOKEN (or GTNH_GITHUB_TOKEN_FILE) is required to download GitHub Actions daily artifacts."
-    logError "Use a read-only token with Actions access and store it as a secret in Coolify."
+  if (( current_java_version != 8 && current_java_version < 17 )); then
+    logError "GTNH daily builds require Java 8 or a supported Java 17+ runtime; found Java $current_java_version."
     exit 1
   fi
 
-  if (( current_java_version == 8 )); then
-    java_variant="server-java8"
-  elif (( current_java_version >= 17 && current_java_version <= 25 )); then
-    java_variant="server-java17-25"
+  if isExactDailyGTNHpackVersion; then
+    release_url+="/tags/${GTNH_PACK_VERSION//+/%2B}"
+    log "Resolving pinned GTNH daily $GTNH_PACK_VERSION from the public release mirror."
   else
-    logError "GTNH daily builds support Java 8 or Java 17-25; found Java $current_java_version."
-    exit 1
+    release_url+="?per_page=100"
+    log "Resolving the newest published GTNH daily from the public release mirror."
   fi
 
-  if [[ "$GTNH_PACK_VERSION" == "daily" || "$GTNH_PACK_VERSION" == "latest-daily" ]]; then
-    log "Resolving the latest successful tested GTNH daily workflow run."
-    if ! run_json="$(githubApiCurl \
-        "$GTNH_GITHUB_API/repos/$GTNH_DAILY_REPOSITORY/actions/workflows/$GTNH_DAILY_WORKFLOW/runs?branch=master&status=success&per_page=10")"; then
-      logError "Unable to retrieve GTNH daily workflow runs from GitHub."
+  # Distinguish a removed pin from transient API failures.
+  if ! response="$(githubApiCurl -w $'\n%{http_code}' "$release_url")"; then
+    http_status="${response##*$'\n'}"
+    if [[ "$http_status" == "404" ]] && isExactDailyGTNHpackVersion; then
+      logError "$GTNH_PACK_VERSION is not on the public daily mirror (the last 30 dailies, starting with build 702)."
+      logError "Choose a retained daily tag from https://github.com/$GTNH_DAILY_RELEASE_REPOSITORY/releases."
       exit 1
     fi
-    artifacts_url="$(jq -r '.workflow_runs | map(select(.conclusion == "success")) | first | .artifacts_url // empty' <<< "$run_json")"
-    if [[ -z "$artifacts_url" ]]; then
-      logError "No successful GTNH daily workflow run was found."
-      exit 1
-    fi
-  else
-    build_id="${GTNH_PACK_VERSION#daily-}"
-    artifact_name="GTNH-daily-${build_id}-${java_variant}.zip"
-    log "Resolving exact tested GTNH daily artifact $artifact_name."
-    local encoded_artifact_name="${artifact_name//+/%2B}"
-    artifacts_url="$GTNH_GITHUB_API/repos/$GTNH_DAILY_REPOSITORY/actions/artifacts?name=$encoded_artifact_name&per_page=100"
-  fi
-
-  if ! artifacts_json="$(githubApiCurl "$artifacts_url")"; then
-    logError "Unable to retrieve GTNH daily artifact metadata from GitHub."
+    logError "Unable to retrieve the GTNH daily mirror (HTTP $http_status). Check connectivity or retry after GitHub's API limit resets."
     exit 1
   fi
-
-  if [[ -n "$artifact_name" ]]; then
-    artifact="$(jq -c --arg name "$artifact_name" \
-      '.artifacts | map(select(.name == $name and (.expired | not))) | sort_by(.created_at) | last // empty' \
-      <<< "$artifacts_json")"
+  releases_json="${response%$'\n'*}"
+  if isExactDailyGTNHpackVersion; then
+    release="$(jq -c --arg tag "$GTNH_PACK_VERSION" 'select(.draft == false and .tag_name == $tag)' <<< "$releases_json")" || exit 1
   else
-    artifact="$(jq -c --arg suffix "-$java_variant.zip" \
-      '.artifacts | map(select((.expired | not) and (.name | endswith($suffix)))) | sort_by(.created_at) | last // empty' \
-      <<< "$artifacts_json")"
+    # Build numbers are monotonic; publication order can change after a rerun.
+    release="$(jq -c 'map(select(.draft == false and (.tag_name | test("^daily-[0-9]{4}-[0-9]{2}-[0-9]{2}\\+[0-9]+$"))))
+      | sort_by(.tag_name | split("+") | last | tonumber) | last // empty' <<< "$releases_json")" || exit 1
   fi
-
-  if [[ -z "$artifact" ]]; then
-    logError "The requested GTNH daily artifact was not found or has expired."
-    logError "Choose a successful build still listed on the DreamAssemblerXXL Actions page."
+  if [[ -z "$release" ]] || ! jq -e '.assets | type == "array"' <<< "$release" >/dev/null; then
+    logError "No published GTNH daily release metadata was found on the mirror."
     exit 1
   fi
-
-  artifact_name="$(jq -r '.name' <<< "$artifact")"
-  build_id="${artifact_name#GTNH-daily-}"
-  build_id="${build_id%-"$java_variant".zip}"
+  tag="$(jq -r '.tag_name' <<< "$release")"
+  if ! asset="$(jq -c '[.assets[] | select(.state == "uploaded")]' <<< "$release" | compatibleDailyGTNHarchive "$tag")"; then
+    logError "The mirrored build $tag has no uploaded server ZIP supporting Java $current_java_version. Check its release assets and JVM requirements."
+    exit 1
+  fi
+  if ! jq -e '(.digest // "" | test("^sha256:[0-9a-fA-F]{64}$")) and
+      (.size | type == "number" and . > 0 and . == floor) and
+      (.browser_download_url // "" | startswith("https://"))' <<< "$asset" >/dev/null; then
+    logError "The mirrored server asset is missing valid SHA-256, size, or public download URL metadata."
+    exit 1
+  fi
   setGTNHdownloadPath \
-    "$(jq -r '.archive_download_url' <<< "$artifact")" \
-    "$artifact_name" \
-    "github-actions" \
-    "$(jq -r '.digest // empty' <<< "$artifact" | sed 's/^sha256://')" \
-    "$(jq -r '.size_in_bytes // empty' <<< "$artifact")"
-  log "Selected tested GTNH daily build $build_id for Java $current_java_version."
+    "$(jq -r '.browser_download_url' <<< "$asset")" \
+    "$(jq -r '.name' <<< "$asset")" \
+    "github-release" \
+    "$(jq -r '.digest | sub("^sha256:"; "")' <<< "$asset")" \
+    "$(jq -r '.size' <<< "$asset")"
+  log "Selected mirrored GTNH daily build $tag for Java $current_java_version."
   return 0
 }
 
@@ -619,21 +580,11 @@ function downloadGTNH(){
   if isFalse "$cache_hit"; then
     [[ -z "$gtnh_download" ]] || rm -f "$gtnh_download"
     gtnhManagerLog "[2/5] Downloading artifact into the persistent cache."
-    if [[ "$gtnh_download_kind" == "github-actions" ]]; then
-      if ! githubApiCurl --retry 3 --retry-all-errors --continue-at - -o "$artifact_part" "$gtnh_download_path"; then
-        rm -f "$artifact_part"
-        if ! githubApiCurl --retry 3 --retry-all-errors -o "$artifact_part" "$gtnh_download_path"; then
-          logError "Failed to download GTNH daily artifact. Check token permissions and artifact expiry."
-          return 1
-        fi
-      fi
-    else
-      if ! curl -fsSL --retry 3 --retry-all-errors --continue-at - -o "$artifact_part" "$gtnh_download_path"; then
-        rm -f "$artifact_part"
-        if ! curl -fsSL --retry 3 --retry-all-errors -o "$artifact_part" "$gtnh_download_path"; then
-          logError "Failed to download $gtnh_download_path"
-          return 1
-        fi
+    if ! curl -fsSL --retry 3 --retry-all-errors --continue-at - -o "$artifact_part" "$gtnh_download_path"; then
+      rm -f "$artifact_part"
+      if ! curl -fsSL --retry 3 --retry-all-errors -o "$artifact_part" "$gtnh_download_path"; then
+        logError "Failed to download $gtnh_download_path"
+        return 1
       fi
     fi
 

@@ -45,21 +45,109 @@ function makeValidPack(){
   printf '#!/bin/sh\n' > "$pack/startserver-java9.sh"
 }
 
-function testDailyResolver(){
-  GTNH_PACK_VERSION="daily-2026-07-19+630"
-  GTNH_GITHUB_TOKEN="test-token"
+# Resolver tests run in subshells so API/JVM mocks cannot leak into other tests.
+function testDailyResolver(){ (
   current_java_version=25
+  GTNH_GITHUB_API="https://api.github.test"
+  local tag="daily-2026-09-06+724"
+  local digest="76c31a557fee62dfee9123759695a7cc2a4332de9ced42fb3e605f0005a180e8"
+  local release="" fixture="" expected_url="" api_status=200
+  local api_calls="/tmp/gtnh-daily-api-calls"
+  local output="" variant=""
+  release="$(jq -n --arg tag "$tag" --arg digest "$digest" '{
+    tag_name: $tag, draft: false, prerelease: false, assets: [
+      {name: ("GTNH-" + $tag + "-server-java17-26.zip"), state: "uploaded",
+       digest: ("sha256:" + $digest), size: 551159797,
+       browser_download_url: "https://github.test/releases/server.zip"},
+      {name: ("GTNH-" + $tag + "-server-java8.zip"), state: "uploaded",
+       digest: ("sha256:" + $digest), size: 535824747,
+       browser_download_url: "https://github.test/releases/server-java8.zip"},
+      {name: ("GTNH-" + $tag + "-mmcprism-java17-26.zip"), state: "uploaded"},
+      {name: "config-only.zip", state: "uploaded"}
+    ]}')"
 
-  function githubApiCurl(){
-    printf '%s\n' '{"artifacts":[{"name":"GTNH-daily-2026-07-19+630-server-java17-25.zip","expired":false,"created_at":"2026-07-19T06:30:02Z","archive_download_url":"https://api.github.test/artifacts/8439067728/zip","digest":"sha256:b74dea","size_in_bytes":553632932}]}'
+  # Exercise the real githubApiCurl wrapper as well as the resolver.
+  function curl(){
+    printf '%s\n' "$*" >> "$api_calls"
+    [[ "${*: -1}" == "$expected_url" ]] || return 90
+    [[ "$*" != *Authorization* ]] || return 91
+    printf '%s\n%s' "$fixture" "$api_status"
+    [[ "$api_status" == 200 ]] || return 22
   }
 
+  GTNH_PACK_VERSION="$tag"
+  expected_url="$GTNH_GITHUB_API/repos/$GTNH_DAILY_RELEASE_REPOSITORY/releases/tags/${tag//+/%2B}"
+  fixture="$release"
+  : > "$api_calls"
   selectDailyGTNHpack
-  [[ "$gtnh_selected_id" == "GTNH-daily-2026-07-19+630-server-java17-25.zip" ]]
-  [[ "$gtnh_download_path" == "https://api.github.test/artifacts/8439067728/zip" ]]
-  [[ "$gtnh_download_sha256" == "b74dea" ]]
-  [[ "$gtnh_download_size" == "553632932" ]]
-}
+  [[ "$gtnh_selected_id" == "GTNH-${tag}-server-java17-26.zip" ]]
+  [[ "$gtnh_download_kind" == "github-release" ]]
+  [[ "$gtnh_download_path" == "https://github.test/releases/server.zip" ]]
+  [[ "$gtnh_download_sha256" == "$digest" ]]
+  [[ "$gtnh_download_size" == "551159797" ]]
+  ! grep -q 'Authorization\|/actions/' "$api_calls"
+
+  current_java_version=8
+  selectDailyGTNHpack
+  [[ "$gtnh_selected_id" == "GTNH-${tag}-server-java8.zip" ]]
+  current_java_version=26
+  selectDailyGTNHpack
+  [[ "$gtnh_selected_id" == "GTNH-${tag}-server-java17-26.zip" ]]
+
+  # Legacy range remains valid for Java 25, but not Java 26.
+  fixture="$(jq '(.assets[0].name) |= sub("17-26"; "17-25")' <<< "$release")"
+  if (selectDailyGTNHpack); then exit 1; fi
+  current_java_version=25
+  selectDailyGTNHpack
+  [[ "$gtnh_selected_id" == "GTNH-${tag}-server-java17-25.zip" ]]
+
+  # Sort by build number, include published prereleases, ignore drafts/non-dailies.
+  fixture="$(jq '[. + {prerelease:true}, . + {tag_name:"daily-2026-09-05+723"},
+    . + {tag_name:"daily-2026-09-06+725", draft:true}, . + {tag_name:"unrelated"}]' <<< "$release")"
+  expected_url="$GTNH_GITHUB_API/repos/$GTNH_DAILY_RELEASE_REPOSITORY/releases?per_page=100"
+  for variant in daily latest-daily; do
+    GTNH_PACK_VERSION="$variant"
+    selectDailyGTNHpack
+    [[ "$gtnh_selected_id" == "GTNH-${tag}-server-java17-26.zip" ]]
+  done
+  fixture='[]'
+  if (selectDailyGTNHpack); then exit 1; fi
+
+  GTNH_PACK_VERSION="$tag"
+  expected_url="$GTNH_GITHUB_API/repos/$GTNH_DAILY_RELEASE_REPOSITORY/releases/tags/${tag//+/%2B}"
+  # Missing/wrong/incomplete assets and integrity metadata fail closed.
+  for variant in '.assets = []' '.assets |= .[2:]' '.assets[0].state = "new"' \
+      '.assets[0].name |= sub("724"; "723")' '.assets[0].digest = null' \
+      '.assets[0].digest = "sha256:bad"' '.assets[0].size = 0' \
+      '.assets[0].browser_download_url = null' '.draft = true'; do
+    fixture="$(jq "$variant" <<< "$release")"
+    if (selectDailyGTNHpack); then echo "Accepted invalid release: $variant" >&2; exit 1; fi
+  done
+  fixture='not JSON'
+  if (selectDailyGTNHpack); then exit 1; fi
+  fixture="$release"
+  current_java_version=27
+  if (selectDailyGTNHpack); then exit 1; fi
+  current_java_version=11
+  if (selectDailyGTNHpack); then exit 1; fi
+  current_java_version=25
+
+  # API failures must never trigger a lookup outside the public mirror.
+  for api_status in 401 403 429 500; do
+    : > "$api_calls"
+    if (selectDailyGTNHpack); then exit 1; fi
+    ! grep -q '/actions/' "$api_calls"
+  done
+  api_status=404
+  : > "$api_calls"
+  if output="$(selectDailyGTNHpack 2>&1)"; then exit 1; fi
+  grep -q 'last 30 dailies' <<< "$output"
+  grep -q 'Choose a retained daily tag' <<< "$output"
+  ! grep -q '/actions/' "$api_calls"
+  GTNH_PACK_VERSION=latest-daily
+  expected_url="$GTNH_GITHUB_API/repos/$GTNH_DAILY_RELEASE_REPOSITORY/releases?per_page=100"
+  if (selectDailyGTNHpack); then exit 1; fi
+) }
 
 function testArchiveValidation(){
   local fixture_root="/tmp/gtnh-validation"
@@ -82,12 +170,16 @@ function testArchiveValidation(){
 function testInstalledPinnedDailyNeedsNoArtifact(){
   resetData
   GTNH_PACK_VERSION="daily-2026-07-19+630"
-  unset GTNH_GITHUB_TOKEN
   printf 'GTNH-daily-2026-07-19+630-server-java17-25.zip\n' > /data/.gtnh-version
   exactDailyGTNHisAlreadyInstalled
+  GTNH_PACK_VERSION="daily-2026-09-06+724"
+  printf 'GTNH-daily-2026-09-06+724-server-java17-26.zip\n' > /data/.gtnh-version
+  exactDailyGTNHisAlreadyInstalled
+  GTNH_PACK_VERSION="daily-2026-09-06+723"
+  if exactDailyGTNHisAlreadyInstalled; then exit 1; fi
 }
 
-function testArtifactCacheAndResume(){
+function testArtifactCacheAndResume(){ (
   local fixture_root="/tmp/gtnh-cache-test"
   local fixture_archive="$fixture_root/server.zip"
   local download_count_file="$fixture_root/download-count"
@@ -107,13 +199,14 @@ function testArtifactCacheAndResume(){
   GTNH_MIN_MOD_JARS=2
   current_java_version=25
   gtnh_selected_id="GTNH-daily-cache-test-server-java17-25.zip"
-  gtnh_download_path="https://api.github.test/cache-test.zip"
-  gtnh_download_kind="github-actions"
+  gtnh_download_path="https://github.test/cache-test.zip"
+  gtnh_download_kind="github-release"
   gtnh_download_sha256="$(sha256sum "$fixture_archive" | awk '{print $1}')"
   gtnh_download_size="$(stat -c '%s' "$fixture_archive")"
 
-  function githubApiCurl(){
+  function curl(){
     local output=""
+    [[ "$*" != *Authorization* ]] || return 91
     while (( $# > 0 )); do
       if [[ "$1" == "-o" ]]; then
         output="$2"
@@ -149,7 +242,16 @@ function testArtifactCacheAndResume(){
   downloadGTNH
   [[ "$(cat "$download_count_file")" == "1" ]]
   [[ -s "$expected_staging/validated.json" ]]
-}
+
+  # Corrupt size/digest metadata must never reach extraction or live files.
+  rm -f "$gtnh_manager_artifact_path"
+  gtnh_download_size=1
+  if downloadGTNH; then echo "Accepted wrong archive size" >&2; exit 1; fi
+  gtnh_download_size="$(stat -c '%s' "$fixture_archive")"
+  gtnh_download_sha256="$(printf '%064d' 0)"
+  if downloadGTNH; then echo "Accepted wrong archive digest" >&2; exit 1; fi
+  assertFileContains /data/.gtnh-version GT_New_Horizons_2.9.0-beta-2_Server_Java_17-25.zip
+) }
 
 function testTransactionalUpdate(){
   local stage="/tmp/gtnh-transaction/new-pack"
